@@ -6,6 +6,7 @@ const { Pool } = require("pg");
 const crypto = require("crypto");
 
 const app = express();
+
 app.use(cors());
 app.use(express.json({ limit: "100kb" }));
 
@@ -27,6 +28,7 @@ const pool = new Pool({
     : { rejectUnauthorized: false }
 });
 
+// Initialize database without deleting existing data.
 async function initializeDatabase() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS players (
@@ -64,6 +66,11 @@ async function initializeDatabase() {
       ADD COLUMN IF NOT EXISTS ban_reason TEXT,
       ADD COLUMN IF NOT EXISTS ban_expires_at TIMESTAMPTZ,
       ADD COLUMN IF NOT EXISTS banned_at TIMESTAMPTZ;
+
+    -- New reward-code features. Existing codes remain unlimited.
+    ALTER TABLE reward_codes
+      ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS max_uses INTEGER NOT NULL DEFAULT 0;
   `);
 }
 
@@ -79,6 +86,7 @@ function createToken(user) {
   );
 }
 
+// Authentication and automatic expiration of temporary bans.
 async function requireAuth(req, res, next) {
   const header = req.headers.authorization || "";
   const token = header.startsWith("Bearer ")
@@ -182,11 +190,18 @@ function safeTextEqual(a, b) {
     crypto.timingSafeEqual(left, right);
 }
 
+function normalizeRewardCode(value) {
+  return String(value || "")
+    .trim()
+    .normalize("NFC")
+    .toUpperCase();
+}
+
 app.get("/", (req, res) => {
   res.json({
     name: "Bozorgshahr Server",
     status: "online",
-    version: "1.2.0"
+    version: "1.3.0"
   });
 });
 
@@ -207,7 +222,8 @@ app.get("/health", async (req, res, next) => {
 app.post("/api/register", async (req, res, next) => {
   try {
     const username = String(req.body.username || "")
-      .trim().toLowerCase();
+      .trim()
+      .toLowerCase();
 
     const password = String(req.body.password || "");
 
@@ -253,7 +269,6 @@ app.post("/api/register", async (req, res, next) => {
       }),
       player: publicPlayer(player)
     });
-
   } catch (error) {
     if (error.code === "23505") {
       return res.status(409).json({
@@ -269,7 +284,8 @@ app.post("/api/register", async (req, res, next) => {
 app.post("/api/login", async (req, res, next) => {
   try {
     const username = String(req.body.username || "")
-      .trim().toLowerCase();
+      .trim()
+      .toLowerCase();
 
     const password = String(req.body.password || "");
 
@@ -308,7 +324,6 @@ app.post("/api/login", async (req, res, next) => {
       player.ban_reason = null;
       player.ban_expires_at = null;
       player.banned_at = null;
-
     } else if (player.is_banned) {
       return res.status(403).json({
         error: "حساب شما مسدود شده است.",
@@ -330,7 +345,6 @@ app.post("/api/login", async (req, res, next) => {
       }),
       player: publicPlayer(player)
     });
-
   } catch (error) {
     next(error);
   }
@@ -363,7 +377,9 @@ app.post("/api/admin/login", (req, res) => {
 app.get("/api/me", requireAuth, async (req, res, next) => {
   try {
     if (req.auth.role !== "player") {
-      return res.status(403).json({ error: "حساب بازیکن لازم است." });
+      return res.status(403).json({
+        error: "حساب بازیکن لازم است."
+      });
     }
 
     const result = await pool.query(
@@ -372,10 +388,14 @@ app.get("/api/me", requireAuth, async (req, res, next) => {
     );
 
     if (!result.rows[0]) {
-      return res.status(404).json({ error: "بازیکن پیدا نشد." });
+      return res.status(404).json({
+        error: "بازیکن پیدا نشد."
+      });
     }
 
-    res.json({ player: publicPlayer(result.rows[0]) });
+    res.json({
+      player: publicPlayer(result.rows[0])
+    });
   } catch (error) {
     next(error);
   }
@@ -385,13 +405,21 @@ app.get("/api/me", requireAuth, async (req, res, next) => {
 app.put("/api/me/game-data", requireAuth, async (req, res, next) => {
   try {
     if (req.auth.role !== "player") {
-      return res.status(403).json({ error: "حساب بازیکن لازم است." });
+      return res.status(403).json({
+        error: "حساب بازیکن لازم است."
+      });
     }
 
     const gameData = req.body.gameData;
 
-    if (!gameData || typeof gameData !== "object" || Array.isArray(gameData)) {
-      return res.status(400).json({ error: "اطلاعات بازی معتبر نیست." });
+    if (
+      !gameData ||
+      typeof gameData !== "object" ||
+      Array.isArray(gameData)
+    ) {
+      return res.status(400).json({
+        error: "اطلاعات بازی معتبر نیست."
+      });
     }
 
     const result = await pool.query(
@@ -401,10 +429,14 @@ app.put("/api/me/game-data", requireAuth, async (req, res, next) => {
     );
 
     if (!result.rows[0]) {
-      return res.status(404).json({ error: "بازیکن پیدا نشد." });
+      return res.status(404).json({
+        error: "بازیکن پیدا نشد."
+      });
     }
 
-    res.json({ player: publicPlayer(result.rows[0]) });
+    res.json({
+      player: publicPlayer(result.rows[0])
+    });
   } catch (error) {
     next(error);
   }
@@ -416,13 +448,19 @@ app.get("/api/admin/stats", requireAuth, requireAdmin, async (req, res, next) =>
     const result = await pool.query(`
       SELECT
         (SELECT COUNT(*) FROM players) AS total_players,
-        (SELECT COUNT(*) FROM players WHERE is_banned = TRUE
-          AND (ban_expires_at IS NULL OR ban_expires_at > NOW())) AS banned_players,
+        (SELECT COUNT(*) FROM players
+          WHERE is_banned = TRUE
+          AND (ban_expires_at IS NULL OR ban_expires_at > NOW())
+        ) AS banned_players,
         (SELECT COUNT(*) FROM reward_codes) AS total_reward_codes,
-        (SELECT COUNT(*) FROM reward_codes WHERE active = TRUE) AS active_reward_codes
+        (SELECT COUNT(*) FROM reward_codes
+          WHERE active = TRUE
+        ) AS active_reward_codes
     `);
 
-    res.json({ stats: result.rows[0] });
+    res.json({
+      stats: result.rows[0]
+    });
   } catch (error) {
     next(error);
   }
@@ -435,7 +473,9 @@ app.get("/api/admin/players", requireAuth, requireAdmin, async (req, res, next) 
       "SELECT * FROM players ORDER BY created_at DESC LIMIT 500"
     );
 
-    res.json({ players: result.rows.map(publicPlayer) });
+    res.json({
+      players: result.rows.map(publicPlayer)
+    });
   } catch (error) {
     next(error);
   }
@@ -450,10 +490,14 @@ app.get("/api/admin/players/:username", requireAuth, requireAdmin, async (req, r
     );
 
     if (!result.rows[0]) {
-      return res.status(404).json({ error: "بازیکن پیدا نشد." });
+      return res.status(404).json({
+        error: "بازیکن پیدا نشد."
+      });
     }
 
-    res.json({ player: publicPlayer(result.rows[0]) });
+    res.json({
+      player: publicPlayer(result.rows[0])
+    });
   } catch (error) {
     next(error);
   }
@@ -462,7 +506,14 @@ app.get("/api/admin/players/:username", requireAuth, requireAdmin, async (req, r
 // Admin: edit a player's game values
 app.patch("/api/admin/players/:id", requireAuth, requireAdmin, async (req, res, next) => {
   try {
-    const allowed = ["displayName", "coins", "level", "score", "hunger", "energy"];
+    const allowed = [
+      "displayName",
+      "coins",
+      "level",
+      "score",
+      "hunger",
+      "energy"
+    ];
 
     const fields = {
       displayName: "display_name",
@@ -477,13 +528,21 @@ app.patch("/api/admin/players/:id", requireAuth, requireAdmin, async (req, res, 
     const values = [];
 
     for (const key of allowed) {
-      if (!Object.prototype.hasOwnProperty.call(req.body, key)) continue;
+      if (!Object.prototype.hasOwnProperty.call(req.body, key)) {
+        continue;
+      }
 
       let value = req.body[key];
 
       if (key === "displayName") {
-        if (typeof value !== "string" || !value.trim() || value.length > 40) {
-          return res.status(400).json({ error: "نام داخل بازی معتبر نیست." });
+        if (
+          typeof value !== "string" ||
+          !value.trim() ||
+          value.length > 40
+        ) {
+          return res.status(400).json({
+            error: "نام داخل بازی معتبر نیست."
+          });
         }
 
         value = value.trim();
@@ -491,19 +550,30 @@ app.patch("/api/admin/players/:id", requireAuth, requireAdmin, async (req, res, 
         value = Number(value);
 
         if (!Number.isSafeInteger(value)) {
-          return res.status(400).json({ error: "مقدار عددی معتبر نیست." });
+          return res.status(400).json({
+            error: "مقدار عددی معتبر نیست."
+          });
         }
 
         if (key === "coins" && value < 0) {
-          return res.status(400).json({ error: "سکه نمی‌تواند منفی باشد." });
+          return res.status(400).json({
+            error: "سکه نمی‌تواند منفی باشد."
+          });
         }
 
         if (key === "level" && value < 1) {
-          return res.status(400).json({ error: "سطح باید حداقل ۱ باشد." });
+          return res.status(400).json({
+            error: "سطح باید حداقل ۱ باشد."
+          });
         }
 
-        if (["hunger", "energy"].includes(key) && (value < 0 || value > 100)) {
-          return res.status(400).json({ error: "مقدار باید بین ۰ تا ۱۰۰ باشد." });
+        if (
+          ["hunger", "energy"].includes(key) &&
+          (value < 0 || value > 100)
+        ) {
+          return res.status(400).json({
+            error: "مقدار باید بین ۰ تا ۱۰۰ باشد."
+          });
         }
       }
 
@@ -512,22 +582,29 @@ app.patch("/api/admin/players/:id", requireAuth, requireAdmin, async (req, res, 
     }
 
     if (!updates.length) {
-      return res.status(400).json({ error: "مقداری برای تغییر ارسال نشده است." });
+      return res.status(400).json({
+        error: "مقداری برای تغییر ارسال نشده است."
+      });
     }
 
     values.push(req.params.id);
 
     const result = await pool.query(
       `UPDATE players SET ${updates.join(", ")}
-       WHERE id = $${values.length} RETURNING *`,
+       WHERE id = $${values.length}
+       RETURNING *`,
       values
     );
 
     if (!result.rows[0]) {
-      return res.status(404).json({ error: "بازیکن پیدا نشد." });
+      return res.status(404).json({
+        error: "بازیکن پیدا نشد."
+      });
     }
 
-    res.json({ player: publicPlayer(result.rows[0]) });
+    res.json({
+      player: publicPlayer(result.rows[0])
+    });
   } catch (error) {
     next(error);
   }
@@ -550,30 +627,46 @@ app.post("/api/admin/players/:id/ban", requireAuth, requireAdmin, async (req, re
     if (type === "temporary") {
       const durationHours = Number(req.body.durationHours);
 
-      if (!Number.isFinite(durationHours) || durationHours <= 0 || durationHours > 8760) {
+      if (
+        !Number.isFinite(durationHours) ||
+        durationHours <= 0 ||
+        durationHours > 8760
+      ) {
         return res.status(400).json({
           error: "مدت مسدودسازی باید بیشتر از صفر و حداکثر ۳۶۵ روز باشد."
         });
       }
 
-      expiresAt = new Date(Date.now() + durationHours * 60 * 60 * 1000);
+      expiresAt = new Date(
+        Date.now() + durationHours * 60 * 60 * 1000
+      );
     } else if (type !== "permanent") {
-      return res.status(400).json({ error: "نوع مسدودسازی معتبر نیست." });
+      return res.status(400).json({
+        error: "نوع مسدودسازی معتبر نیست."
+      });
     }
 
     const result = await pool.query(
       `UPDATE players
-       SET is_banned = TRUE, ban_reason = $1,
-           ban_expires_at = $2, banned_at = NOW()
-       WHERE id = $3 RETURNING *`,
+       SET is_banned = TRUE,
+           ban_reason = $1,
+           ban_expires_at = $2,
+           banned_at = NOW()
+       WHERE id = $3
+       RETURNING *`,
       [reason, expiresAt, req.params.id]
     );
 
     if (!result.rows[0]) {
-      return res.status(404).json({ error: "بازیکن پیدا نشد." });
+      return res.status(404).json({
+        error: "بازیکن پیدا نشد."
+      });
     }
 
-    res.json({ success: true, player: publicPlayer(result.rows[0]) });
+    res.json({
+      success: true,
+      player: publicPlayer(result.rows[0])
+    });
   } catch (error) {
     next(error);
   }
@@ -584,56 +677,116 @@ app.post("/api/admin/players/:id/unban", requireAuth, requireAdmin, async (req, 
   try {
     const result = await pool.query(
       `UPDATE players
-       SET is_banned = FALSE, ban_reason = NULL,
-           ban_expires_at = NULL, banned_at = NULL
-       WHERE id = $1 RETURNING *`,
+       SET is_banned = FALSE,
+           ban_reason = NULL,
+           ban_expires_at = NULL,
+           banned_at = NULL
+       WHERE id = $1
+       RETURNING *`,
       [req.params.id]
     );
 
     if (!result.rows[0]) {
-      return res.status(404).json({ error: "بازیکن پیدا نشد." });
+      return res.status(404).json({
+        error: "بازیکن پیدا نشد."
+      });
     }
 
-    res.json({ success: true, player: publicPlayer(result.rows[0]) });
+    res.json({
+      success: true,
+      player: publicPlayer(result.rows[0])
+    });
   } catch (error) {
     next(error);
   }
 });
-
 // Admin: create or update a reward code
 app.post("/api/admin/reward-codes", requireAuth, requireAdmin, async (req, res, next) => {
   try {
-    const code = String(req.body.code || "").trim().normalize("NFC").toUpperCase();
+    const code = normalizeRewardCode(req.body.code);
     const coins = Number(req.body.coins);
+    const maxUses = Number(req.body.maxUses ?? 0);
 
-    if (!/^[\p{L}\p{N}_-]{3,64}$/u.test(code) ||
-        !Number.isSafeInteger(coins) || coins < 0) {
-      return res.status(400).json({ error: "کد یا مقدار جایزه معتبر نیست." });
+    let expiresAt = null;
+
+    if (req.body.expiresAt) {
+      expiresAt = new Date(req.body.expiresAt);
+
+      if (
+        Number.isNaN(expiresAt.getTime()) ||
+        expiresAt.getTime() <= Date.now()
+      ) {
+        return res.status(400).json({
+          error: "تاریخ انقضا باید معتبر و در آینده باشد."
+        });
+      }
+    }
+
+    if (
+      !/^[\p{L}\p{N}_-]{3,64}$/u.test(code) ||
+      !Number.isSafeInteger(coins) ||
+      coins < 0 ||
+      !Number.isSafeInteger(maxUses) ||
+      maxUses < 0 ||
+      maxUses > 2147483647
+    ) {
+      return res.status(400).json({
+        error: "اطلاعات کد جایزه معتبر نیست."
+      });
     }
 
     const result = await pool.query(
-      `INSERT INTO reward_codes (code, coins)
-       VALUES ($1, $2)
+      `INSERT INTO reward_codes
+       (code, coins, active, expires_at, max_uses)
+       VALUES ($1, $2, TRUE, $3, $4)
        ON CONFLICT (code) DO UPDATE
-       SET coins = EXCLUDED.coins, active = TRUE
-       RETURNING id, code, coins, active, created_at`,
-      [code, coins]
+       SET coins = EXCLUDED.coins,
+           active = TRUE,
+           expires_at = EXCLUDED.expires_at,
+           max_uses = EXCLUDED.max_uses
+       RETURNING id, code, coins, active, created_at,
+                 expires_at, max_uses`,
+      [code, coins, expiresAt, maxUses]
     );
 
-    res.status(201).json({ rewardCode: result.rows[0] });
+    res.status(201).json({
+      rewardCode: result.rows[0]
+    });
   } catch (error) {
     next(error);
   }
 });
 
-// Admin: list reward codes
+// Admin: list reward codes with usage information
 app.get("/api/admin/reward-codes", requireAuth, requireAdmin, async (req, res, next) => {
   try {
-    const result = await pool.query(
-      "SELECT id, code, coins, active, created_at FROM reward_codes ORDER BY id DESC"
-    );
+    const result = await pool.query(`
+      SELECT
+        rc.id,
+        rc.code,
+        rc.coins,
+        rc.active,
+        rc.created_at,
+        rc.expires_at,
+        rc.max_uses,
+        COUNT(rr.player_id)::INTEGER AS used_count,
+        CASE
+          WHEN rc.max_uses = 0 THEN NULL
+          ELSE GREATEST(
+            rc.max_uses - COUNT(rr.player_id)::INTEGER,
+            0
+          )
+        END AS remaining_uses
+      FROM reward_codes rc
+      LEFT JOIN reward_redemptions rr
+        ON rr.code_id = rc.id
+      GROUP BY rc.id
+      ORDER BY rc.id DESC
+    `);
 
-    res.json({ rewardCodes: result.rows });
+    res.json({
+      rewardCodes: result.rows
+    });
   } catch (error) {
     next(error);
   }
@@ -643,46 +796,62 @@ app.get("/api/admin/reward-codes", requireAuth, requireAdmin, async (req, res, n
 app.patch("/api/admin/reward-codes/:id", requireAuth, requireAdmin, async (req, res, next) => {
   try {
     if (typeof req.body.active !== "boolean") {
-      return res.status(400).json({ error: "وضعیت فعال بودن معتبر نیست." });
+      return res.status(400).json({
+        error: "وضعیت فعال بودن معتبر نیست."
+      });
     }
 
     const result = await pool.query(
-      `UPDATE reward_codes SET active = $1
+      `UPDATE reward_codes
+       SET active = $1
        WHERE id = $2
-       RETURNING id, code, coins, active, created_at`,
+       RETURNING id, code, coins, active, created_at,
+                 expires_at, max_uses`,
       [req.body.active, req.params.id]
     );
 
     if (!result.rows[0]) {
-      return res.status(404).json({ error: "کد پیدا نشد." });
+      return res.status(404).json({
+        error: "کد پیدا نشد."
+      });
     }
 
-    res.json({ rewardCode: result.rows[0] });
+    res.json({
+      rewardCode: result.rows[0]
+    });
   } catch (error) {
     next(error);
   }
 });
 
-// Player: redeem a reward code once per account
+// Player: redeem a reward code once per account.
 app.post("/api/redeem", requireAuth, async (req, res, next) => {
   let client;
 
   try {
     if (req.auth.role !== "player") {
-      return res.status(403).json({ error: "حساب بازیکن لازم است." });
+      return res.status(403).json({
+        error: "حساب بازیکن لازم است."
+      });
     }
 
-    const code = String(req.body.code || "").trim().normalize("NFC").toUpperCase();
+    const code = normalizeRewardCode(req.body.code);
 
-    if (!code || code.length > 64) {
-      return res.status(400).json({ error: "کد معتبر نیست." });
+    if (!/^[\p{L}\p{N}_-]{3,64}$/u.test(code)) {
+      return res.status(400).json({
+        error: "کد معتبر نیست."
+      });
     }
 
     client = await pool.connect();
     await client.query("BEGIN");
 
+    // Lock the reward code so simultaneous requests cannot exceed its limit.
     const codeResult = await client.query(
-      "SELECT * FROM reward_codes WHERE code = $1 AND active = TRUE FOR UPDATE",
+      `SELECT *
+       FROM reward_codes
+       WHERE code = $1 AND active = TRUE
+       FOR UPDATE`,
       [code]
     );
 
@@ -690,42 +859,125 @@ app.post("/api/redeem", requireAuth, async (req, res, next) => {
 
     if (!reward) {
       await client.query("ROLLBACK");
-      return res.status(404).json({ error: "کد جایزه معتبر نیست." });
+
+      return res.status(404).json({
+        error: "کد جایزه معتبر نیست."
+      });
     }
 
+    // Check expiration.
+    if (
+      reward.expires_at &&
+      new Date(reward.expires_at).getTime() <= Date.now()
+    ) {
+      await client.query("ROLLBACK");
+
+      return res.status(410).json({
+        error: "مهلت استفاده از این کد جایزه به پایان رسیده است."
+      });
+    }
+
+    // Each player can redeem the same code only once.
+    const previousUse = await client.query(
+      `SELECT 1
+       FROM reward_redemptions
+       WHERE player_id = $1 AND code_id = $2`,
+      [req.auth.sub, reward.id]
+    );
+
+    if (previousUse.rowCount > 0) {
+      await client.query("ROLLBACK");
+
+      return res.status(409).json({
+        error: "این کد قبلاً توسط شما استفاده شده است."
+      });
+    }
+
+    // max_uses = 0 means unlimited use.
+    if (reward.max_uses > 0) {
+      const usageResult = await client.query(
+        `SELECT COUNT(*)::INTEGER AS used_count
+         FROM reward_redemptions
+         WHERE code_id = $1`,
+        [reward.id]
+      );
+
+      const usedCount = usageResult.rows[0].used_count;
+
+      if (usedCount >= reward.max_uses) {
+        await client.query("ROLLBACK");
+
+        return res.status(409).json({
+          error: "ظرفیت استفاده از این کد جایزه تکمیل شده است."
+        });
+      }
+    }
+
+    // Record redemption.
     const used = await client.query(
       `INSERT INTO reward_redemptions (player_id, code_id)
-       VALUES ($1, $2) ON CONFLICT DO NOTHING RETURNING player_id`,
+       VALUES ($1, $2)
+       ON CONFLICT DO NOTHING
+       RETURNING player_id`,
       [req.auth.sub, reward.id]
     );
 
     if (!used.rowCount) {
       await client.query("ROLLBACK");
-      return res.status(409).json({ error: "این کد قبلاً استفاده شده است." });
+
+      return res.status(409).json({
+        error: "این کد قبلاً توسط شما استفاده شده است."
+      });
     }
 
-    await client.query(
-      "UPDATE players SET coins = coins + $1 WHERE id = $2",
+    // Add coins to the player.
+    const playerResult = await client.query(
+      `UPDATE players
+       SET coins = coins + $1
+       WHERE id = $2
+       RETURNING coins`,
       [reward.coins, req.auth.sub]
     );
 
+    if (!playerResult.rows[0]) {
+      await client.query("ROLLBACK");
+
+      return res.status(404).json({
+        error: "حساب بازیکن پیدا نشد."
+      });
+    }
+
     await client.query("COMMIT");
 
-    res.json({ success: true, coinsAwarded: reward.coins });
+    res.json({
+      success: true,
+      coinsAwarded: reward.coins,
+      totalCoins: playerResult.rows[0].coins
+    });
 
   } catch (error) {
-    if (client) await client.query("ROLLBACK").catch(() => {});
+    if (client) {
+      await client.query("ROLLBACK").catch(() => {});
+    }
+
     next(error);
   } finally {
-    if (client) client.release();
+    if (client) {
+      client.release();
+    }
   }
 });
 
+// Central error handler
 app.use((err, req, res, next) => {
   console.error("Request failed:", err.message);
-  res.status(500).json({ error: "خطای داخلی سرور رخ داد." });
+
+  res.status(500).json({
+    error: "خطای داخلی سرور رخ داد."
+  });
 });
 
+// Start server after database initialization.
 initializeDatabase()
   .then(() => {
     app.listen(PORT, "0.0.0.0", () => {
@@ -733,6 +985,10 @@ initializeDatabase()
     });
   })
   .catch((error) => {
-    console.error("Database initialization failed:", error.message);
+    console.error(
+      "Database initialization failed:",
+      error.message
+    );
+
     process.exit(1);
   });
