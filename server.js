@@ -17,7 +17,7 @@ const ADMIN_USERNAME = process.env.ADMIN_USERNAME;
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
 
 if (!DATABASE_URL || !JWT_SECRET || !ADMIN_USERNAME || !ADMIN_PASSWORD) {
-  console.error("Missing required environment variables.");
+  console.error("Missing required server environment variables.");
   process.exit(1);
 }
 
@@ -28,10 +28,7 @@ const pool = new Pool({
     : { rejectUnauthorized: false }
 });
 
-// --------------------------------------------------
-// DATABASE
-// --------------------------------------------------
-
+// Initialize database without deleting existing data.
 async function initializeDatabase() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS players (
@@ -76,10 +73,6 @@ async function initializeDatabase() {
   `);
 }
 
-// --------------------------------------------------
-// GENERAL HELPERS
-// --------------------------------------------------
-
 function createToken(user) {
   return jwt.sign(
     {
@@ -92,75 +85,28 @@ function createToken(user) {
   );
 }
 
-function publicPlayer(player) {
-  return {
-    id: player.id,
-    username: player.username,
-    displayName: player.display_name,
-    coins: Number(player.coins),
-    level: Number(player.level),
-    score: Number(player.score),
-    hunger: Number(player.hunger),
-    energy: Number(player.energy),
-    gameData: player.game_data || {},
-    createdAt: player.created_at,
-    lastLogin: player.last_login,
-    isBanned: player.is_banned || false,
-    banReason: player.ban_reason || null,
-    banExpiresAt: player.ban_expires_at || null,
-    bannedAt: player.banned_at || null
-  };
-}
-
-function normalizeRewardCode(value) {
-  return String(value || "")
-    .trim()
-    .normalize("NFC")
-    .toUpperCase();
-}
-
-function safeTextEqual(a, b) {
-  const left = Buffer.from(String(a));
-  const right = Buffer.from(String(b));
-
-  return left.length === right.length &&
-    crypto.timingSafeEqual(left, right);
-}
-
-// --------------------------------------------------
-// AUTHENTICATION
-// --------------------------------------------------
-
-function requireAuth(req, res, next) {
+async function requireAuth(req, res, next) {
   const header = req.headers.authorization || "";
-  const token = header.startsWith("Bearer ")
-    ? header.slice(7)
-    : "";
+  const token = header.startsWith("Bearer ") ? header.slice(7) : "";
 
   try {
-    if (!token) {
+    if (!token) throw new Error("Missing token");
+
+    req.auth = jwt.verify(token, JWT_SECRET);
+    next();
+  } catch (error) {
+    if (
+      error.name === "JsonWebTokenError" ||
+      error.name === "TokenExpiredError" ||
+      error.message === "Missing token"
+    ) {
       return res.status(401).json({
         error: "لطفاً دوباره وارد حساب شوید."
       });
     }
 
-    req.auth = jwt.verify(token, JWT_SECRET);
-    next();
-  } catch (error) {
-    return res.status(401).json({
-      error: "نشست شما منقضی شده است؛ دوباره وارد شوید."
-    });
+    next(error);
   }
-}
-
-function requireAdmin(req, res, next) {
-  if (req.auth?.role !== "admin") {
-    return res.status(403).json({
-      error: "دسترسی مدیر لازم است."
-    });
-  }
-
-  next();
 }
 
 async function requireActivePlayer(req, res, next) {
@@ -172,8 +118,7 @@ async function requireActivePlayer(req, res, next) {
     }
 
     const result = await pool.query(
-      `SELECT is_banned, ban_reason, ban_expires_at
-       FROM players WHERE id = $1`,
+      "SELECT * FROM players WHERE id = $1",
       [req.auth.sub]
     );
 
@@ -207,11 +152,12 @@ async function requireActivePlayer(req, res, next) {
       return res.status(403).json({
         error: "حساب شما مسدود شده است.",
         banned: true,
-        banType: player.ban_expires_at
-          ? "temporary"
-          : "permanent",
+        banType: player.ban_expires_at ? "temporary" : "permanent",
         reason: player.ban_reason || "دلیلی ثبت نشده است.",
-        expiresAt: player.ban_expires_at
+        banReason: player.ban_reason || "دلیلی ثبت نشده است.",
+        expiresAt: player.ban_expires_at,
+        banExpiresAt: player.ban_expires_at,
+        player: publicPlayer(player)
       });
     }
 
@@ -221,15 +167,56 @@ async function requireActivePlayer(req, res, next) {
   }
 }
 
-// --------------------------------------------------
-// SERVER STATUS
-// --------------------------------------------------
+function requireAdmin(req, res, next) {
+  if (req.auth?.role !== "admin") {
+    return res.status(403).json({
+      error: "دسترسی مدیر لازم است."
+    });
+  }
+
+  next();
+}
+
+function publicPlayer(player) {
+  return {
+    id: player.id,
+    username: player.username,
+    displayName: player.display_name,
+    coins: player.coins,
+    level: player.level,
+    score: player.score,
+    hunger: player.hunger,
+    energy: player.energy,
+    gameData: player.game_data,
+    createdAt: player.created_at,
+    lastLogin: player.last_login,
+    isBanned: player.is_banned || false,
+    banReason: player.ban_reason || null,
+    banExpiresAt: player.ban_expires_at || null,
+    bannedAt: player.banned_at || null
+  };
+}
+
+function safeTextEqual(a, b) {
+  const left = Buffer.from(String(a));
+  const right = Buffer.from(String(b));
+
+  return left.length === right.length &&
+    crypto.timingSafeEqual(left, right);
+}
+
+function normalizeRewardCode(value) {
+  return String(value || "")
+    .trim()
+    .normalize("NFC")
+    .toUpperCase();
+}
 
 app.get("/", (req, res) => {
   res.json({
     name: "Bozorgshahr Server",
     status: "online",
-    version: "2.0.0"
+    version: "1.3.0"
   });
 });
 
@@ -246,10 +233,7 @@ app.get("/health", async (req, res, next) => {
   }
 });
 
-// --------------------------------------------------
-// PLAYER REGISTER
-// --------------------------------------------------
-
+// Player registration
 app.post("/api/register", async (req, res, next) => {
   try {
     const username = String(req.body.username || "")
@@ -257,13 +241,14 @@ app.post("/api/register", async (req, res, next) => {
       .toLowerCase();
 
     const password = String(req.body.password || "");
+
     const displayName = String(
       req.body.displayName || username
     ).trim();
 
-    if (!/^[a-zA-Z0-9_]{3,24}$/.test(username)) {
+    if (!/^[a-z0-9_]{3,24}$/.test(username)) {
       return res.status(400).json({
-        error: "نام کاربری باید ۳ تا ۲۴ نویسه و شامل حروف انگلیسی، عدد یا زیرخط باشد."
+        error: "نام کاربری باید ۳ تا ۲۴ حرف انگلیسی، عدد یا زیرخط باشد."
       });
     }
 
@@ -275,18 +260,7 @@ app.post("/api/register", async (req, res, next) => {
 
     if (!displayName || displayName.length > 40) {
       return res.status(400).json({
-        error: "نام نمایشی معتبر نیست."
-      });
-    }
-
-    const existing = await pool.query(
-      "SELECT id FROM players WHERE username = $1",
-      [username]
-    );
-
-    if (existing.rowCount > 0) {
-      return res.status(409).json({
-        error: "این نام کاربری قبلاً ثبت شده است."
+        error: "نام داخل بازی معتبر نیست."
       });
     }
 
@@ -303,7 +277,6 @@ app.post("/api/register", async (req, res, next) => {
     const player = result.rows[0];
 
     res.status(201).json({
-      success: true,
       token: createToken({
         id: player.id,
         username: player.username,
@@ -322,10 +295,7 @@ app.post("/api/register", async (req, res, next) => {
   }
 });
 
-// --------------------------------------------------
-// PLAYER LOGIN
-// --------------------------------------------------
-
+// Player login
 app.post("/api/login", async (req, res, next) => {
   try {
     const username = String(req.body.username || "")
@@ -333,12 +303,6 @@ app.post("/api/login", async (req, res, next) => {
       .toLowerCase();
 
     const password = String(req.body.password || "");
-
-    if (!username || !password) {
-      return res.status(400).json({
-        error: "نام کاربری و رمز عبور را وارد کنید."
-      });
-    }
 
     const result = await pool.query(
       "SELECT * FROM players WHERE username = $1",
@@ -361,10 +325,7 @@ app.post("/api/login", async (req, res, next) => {
       [player.id]
     );
 
-    player.last_login = new Date();
-
     res.json({
-      success: true,
       token: createToken({
         id: player.id,
         username: player.username,
@@ -377,10 +338,7 @@ app.post("/api/login", async (req, res, next) => {
   }
 });
 
-// --------------------------------------------------
-// ADMIN LOGIN
-// --------------------------------------------------
-
+// Admin login
 app.post("/api/admin/login", (req, res) => {
   const username = String(req.body.username || "");
   const password = String(req.body.password || "");
@@ -390,12 +348,11 @@ app.post("/api/admin/login", (req, res) => {
     !safeTextEqual(password, ADMIN_PASSWORD)
   ) {
     return res.status(401).json({
-      error: "نام کاربری یا رمز عبور مدیر اشتباه است."
+      error: "اطلاعات ورود مدیر اشتباه است."
     });
   }
 
   res.json({
-    success: true,
     token: createToken({
       id: "admin",
       username: ADMIN_USERNAME,
@@ -404,10 +361,7 @@ app.post("/api/admin/login", (req, res) => {
   });
 });
 
-// --------------------------------------------------
-// GET CURRENT PLAYER
-// --------------------------------------------------
-
+// Current player's saved information
 app.get("/api/me", requireAuth, async (req, res, next) => {
   try {
     if (req.auth.role !== "player") {
@@ -423,7 +377,7 @@ app.get("/api/me", requireAuth, async (req, res, next) => {
 
     if (!result.rows[0]) {
       return res.status(404).json({
-        error: "حساب بازیکن پیدا نشد."
+        error: "بازیکن پیدا نشد."
       });
     }
 
@@ -434,747 +388,627 @@ app.get("/api/me", requireAuth, async (req, res, next) => {
     next(error);
   }
 });
-// --------------------------------------------------
-// SAVE PLAYER GAME DATA
-// --------------------------------------------------
 
-app.put(
-  "/api/me/game-data",
-  requireAuth,
-  requireActivePlayer,
-  async (req, res, next) => {
-    try {
-      const gameData = req.body.gameData;
+// Save game progress; coins and level are server-controlled.
+app.put("/api/me/game-data", requireAuth, requireActivePlayer, async (req, res, next) => {
+  try {
+    if (req.auth.role !== "player") {
+      return res.status(403).json({
+        error: "حساب بازیکن لازم است."
+      });
+    }
 
-      if (
-        !gameData ||
-        typeof gameData !== "object" ||
-        Array.isArray(gameData)
-      ) {
-        return res.status(400).json({
-          error: "اطلاعات بازی معتبر نیست."
-        });
+    const gameData = req.body.gameData;
+
+    if (
+      !gameData ||
+      typeof gameData !== "object" ||
+      Array.isArray(gameData)
+    ) {
+      return res.status(400).json({
+        error: "اطلاعات بازی معتبر نیست."
+      });
+    }
+
+    const result = await pool.query(
+      `UPDATE players SET
+         game_data = COALESCE(game_data, '{}'::jsonb) ||
+           ($1::jsonb - 'coins' - 'level') ||
+           jsonb_build_object('coins', coins, 'level', level),
+         hunger = CASE WHEN ($1::jsonb ? 'hunger') AND ($1::jsonb->>'hunger') ~ '^-?\d+$' THEN LEAST(100, GREATEST(0, (($1::jsonb->>'hunger')::integer))) ELSE hunger END,
+         energy = CASE WHEN ($1::jsonb ? 'energy') AND ($1::jsonb->>'energy') ~ '^-?\d+$' THEN LEAST(100, GREATEST(0, (($1::jsonb->>'energy')::integer))) ELSE energy END,
+         display_name = CASE WHEN ($1::jsonb ? 'playerName') AND length(trim($1::jsonb->>'playerName')) BETWEEN 1 AND 40 THEN trim($1::jsonb->>'playerName') ELSE display_name END
+       WHERE id = $2 RETURNING *`,
+      [JSON.stringify(gameData), req.auth.sub]
+    );
+
+    if (!result.rows[0]) {
+      return res.status(404).json({
+        error: "بازیکن پیدا نشد."
+      });
+    }
+
+    res.json({
+      player: publicPlayer(result.rows[0])
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Admin: dashboard statistics
+app.get("/api/admin/stats", requireAuth, requireAdmin, async (req, res, next) => {
+  try {
+    const result = await pool.query(`
+      SELECT
+        (SELECT COUNT(*) FROM players) AS total_players,
+        (SELECT COUNT(*) FROM players
+          WHERE is_banned = TRUE
+          AND (ban_expires_at IS NULL OR ban_expires_at > NOW())
+        ) AS banned_players,
+        (SELECT COUNT(*) FROM reward_codes) AS total_reward_codes,
+        (SELECT COUNT(*) FROM reward_codes
+          WHERE active = TRUE
+        ) AS active_reward_codes
+    `);
+
+    res.json({
+      stats: result.rows[0]
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Admin: list players
+app.get("/api/admin/players", requireAuth, requireAdmin, async (req, res, next) => {
+  try {
+    const result = await pool.query(
+      "SELECT * FROM players ORDER BY created_at DESC LIMIT 500"
+    );
+
+    res.json({
+      players: result.rows.map(publicPlayer)
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Admin: search one player by username
+app.get("/api/admin/players/:username", requireAuth, requireAdmin, async (req, res, next) => {
+  try {
+    const result = await pool.query(
+      "SELECT * FROM players WHERE username = $1",
+      [String(req.params.username).toLowerCase()]
+    );
+
+    if (!result.rows[0]) {
+      return res.status(404).json({
+        error: "بازیکن پیدا نشد."
+      });
+    }
+
+    res.json({
+      player: publicPlayer(result.rows[0])
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+// Admin: edit a player's game values
+app.patch("/api/admin/players/:id", requireAuth, requireAdmin, async (req, res, next) => {
+  try {
+    const allowed = [
+      "displayName",
+      "coins",
+      "level",
+      "score",
+      "hunger",
+      "energy"
+    ];
+
+    const fields = {
+      displayName: "display_name",
+      coins: "coins",
+      level: "level",
+      score: "score",
+      hunger: "hunger",
+      energy: "energy"
+    };
+
+    const updates = [];
+    const values = [];
+
+    for (const key of allowed) {
+      if (!Object.prototype.hasOwnProperty.call(req.body, key)) {
+        continue;
       }
 
-      const result = await pool.query(
-        `UPDATE players SET
-          game_data =
-            COALESCE(game_data, '{}'::jsonb)
-            || ($1::jsonb - 'coins' - 'level')
-            || jsonb_build_object(
-              'coins', coins,
-              'level', level
-            ),
+      let value = req.body[key];
 
-          hunger = CASE
-            WHEN ($1::jsonb ? 'hunger')
-              AND ($1::jsonb->>'hunger') ~ '^\\d+$'
-            THEN LEAST(
-              100,
-              GREATEST(0, (($1::jsonb->>'hunger')::integer))
-            )
-            ELSE hunger
-          END,
-
-          energy = CASE
-            WHEN ($1::jsonb ? 'energy')
-              AND ($1::jsonb->>'energy') ~ '^\\d+$'
-            THEN LEAST(
-              100,
-              GREATEST(0, (($1::jsonb->>'energy')::integer))
-            )
-            ELSE energy
-          END,
-
-          display_name = CASE
-            WHEN ($1::jsonb ? 'playerName')
-              AND length(trim($1::jsonb->>'playerName'))
-                  BETWEEN 1 AND 40
-            THEN trim($1::jsonb->>'playerName')
-            ELSE display_name
-          END
-
-        WHERE id = $2
-        RETURNING *`,
-        [JSON.stringify(gameData), req.auth.sub]
-      );
-
-      if (!result.rows[0]) {
-        return res.status(404).json({
-          error: "بازیکن پیدا نشد."
-        });
-      }
-
-      res.json({
-        success: true,
-        player: publicPlayer(result.rows[0])
-      });
-    } catch (error) {
-      next(error);
-    }
-  }
-);
-
-// --------------------------------------------------
-// ADMIN STATISTICS
-// --------------------------------------------------
-
-app.get(
-  "/api/admin/stats",
-  requireAuth,
-  requireAdmin,
-  async (req, res, next) => {
-    try {
-      const result = await pool.query(`
-        SELECT
-          (SELECT COUNT(*) FROM players)
-            AS total_players,
-
-          (SELECT COUNT(*) FROM players
-           WHERE is_banned = TRUE
-           AND (
-             ban_expires_at IS NULL
-             OR ban_expires_at > NOW()
-           ))
-            AS banned_players,
-
-          (SELECT COUNT(*) FROM reward_codes)
-            AS total_reward_codes,
-
-          (SELECT COUNT(*) FROM reward_codes
-           WHERE active = TRUE)
-            AS active_reward_codes
-      `);
-
-      res.json({
-        stats: result.rows[0]
-      });
-    } catch (error) {
-      next(error);
-    }
-  }
-);
-
-// --------------------------------------------------
-// ADMIN: LIST PLAYERS
-// --------------------------------------------------
-
-app.get(
-  "/api/admin/players",
-  requireAuth,
-  requireAdmin,
-  async (req, res, next) => {
-    try {
-      const search = String(req.query.search || "").trim();
-
-      const result = await pool.query(
-        `SELECT *
-         FROM players
-         WHERE
-           ($1 = '' OR
-            username ILIKE $2 OR
-            display_name ILIKE $2)
-         ORDER BY id DESC
-         LIMIT 500`,
-        [search, `%${search}%`]
-      );
-
-      res.json({
-        players: result.rows.map(publicPlayer)
-      });
-    } catch (error) {
-      next(error);
-    }
-  }
-);
-
-// --------------------------------------------------
-// ADMIN: EDIT PLAYER
-// --------------------------------------------------
-
-app.patch(
-  "/api/admin/players/:id",
-  requireAuth,
-  requireAdmin,
-  async (req, res, next) => {
-    try {
-      const allowed = [
-        "coins",
-        "level",
-        "score",
-        "hunger",
-        "energy",
-        "displayName"
-      ];
-
-      const updates = [];
-      const values = [];
-      const syncParts = [];
-
-      for (const key of allowed) {
-        if (!Object.prototype.hasOwnProperty.call(req.body, key)) {
-          continue;
+      if (key === "displayName") {
+        if (
+          typeof value !== "string" ||
+          !value.trim() ||
+          value.length > 40
+        ) {
+          return res.status(400).json({
+            error: "نام داخل بازی معتبر نیست."
+          });
         }
 
-        const value = req.body[key];
+        value = value.trim();
+      } else {
+        value = Number(value);
 
-        if (key === "displayName") {
-          const name = String(value || "").trim();
-
-          if (!name || name.length > 40) {
-            return res.status(400).json({
-              error: "نام بازیکن معتبر نیست."
-            });
-          }
-
-          values.push(name);
-          updates.push(`display_name = $${values.length}`);
-          syncParts.push("'playerName', display_name");
-          continue;
-        }
-
-        const number = Number(value);
-
-        if (!Number.isSafeInteger(number)) {
+        if (!Number.isSafeInteger(value)) {
           return res.status(400).json({
             error: "مقدار عددی معتبر نیست."
           });
         }
 
-        if (
-          (key === "coins" || key === "score") &&
-          number < 0
-        ) {
+        if (key === "coins" && value < 0) {
           return res.status(400).json({
-            error: "مقدار نمی‌تواند منفی باشد."
+            error: "سکه نمی‌تواند منفی باشد."
           });
         }
 
-        if (key === "level" && number < 1) {
+        if (key === "level" && value < 1) {
           return res.status(400).json({
             error: "سطح باید حداقل ۱ باشد."
           });
         }
 
         if (
-          (key === "hunger" || key === "energy") &&
-          (number < 0 || number > 100)
+          ["hunger", "energy"].includes(key) &&
+          (value < 0 || value > 100)
         ) {
           return res.status(400).json({
-            error: "مقدار باید بین صفر تا ۱۰۰ باشد."
-          });
-        }
-
-        values.push(number);
-        updates.push(`${key} = $${values.length}`);
-
-        if (key === "coins") {
-          syncParts.push("'coins', coins");
-        }
-
-        if (key === "level") {
-          syncParts.push("'level', level");
-        }
-
-        if (key === "hunger") {
-          syncParts.push("'hunger', hunger");
-        }
-
-        if (key === "energy") {
-          syncParts.push("'energy', energy");
-        }
-
-        if (key === "score") {
-          syncParts.push("'score', score");
-        }
-      }
-
-      if (!updates.length) {
-        return res.status(400).json({
-          error: "هیچ تغییری ارسال نشده است."
-        });
-      }
-
-      values.push(req.params.id);
-
-      let gameDataUpdate = "";
-
-      if (syncParts.length) {
-        gameDataUpdate = `,
-          game_data =
-            COALESCE(game_data, '{}'::jsonb)
-            || jsonb_build_object(${syncParts.join(", ")})`;
-      }
-
-      const result = await pool.query(
-        `UPDATE players
-         SET ${updates.join(", ")}
-         ${gameDataUpdate}
-         WHERE id = $${values.length}
-         RETURNING *`,
-        values
-      );
-
-      if (!result.rows[0]) {
-        return res.status(404).json({
-          error: "بازیکن پیدا نشد."
-        });
-      }
-
-      res.json({
-        success: true,
-        player: publicPlayer(result.rows[0])
-      });
-    } catch (error) {
-      next(error);
-    }
-  }
-);
-
-// --------------------------------------------------
-// ADMIN: BAN PLAYER
-// --------------------------------------------------
-
-app.post(
-  "/api/admin/players/:id/ban",
-  requireAuth,
-  requireAdmin,
-  async (req, res, next) => {
-    try {
-      const reason = String(req.body.reason || "").trim();
-      const type = String(req.body.type || "");
-
-      if (!reason || reason.length > 500) {
-        return res.status(400).json({
-          error: "دلیل مسدودسازی باید بین ۱ تا ۵۰۰ نویسه باشد."
-        });
-      }
-
-      let expiresAt = null;
-
-      if (type === "temporary") {
-        const hours = Number(req.body.durationHours);
-
-        if (
-          !Number.isFinite(hours) ||
-          hours <= 0 ||
-          hours > 8760
-        ) {
-          return res.status(400).json({
-            error: "مدت مسدودسازی معتبر نیست."
-          });
-        }
-
-        expiresAt = new Date(
-          Date.now() + hours * 60 * 60 * 1000
-        );
-      } else if (type !== "permanent") {
-        return res.status(400).json({
-          error: "نوع مسدودسازی معتبر نیست."
-        });
-      }
-
-      const result = await pool.query(
-        `UPDATE players
-         SET is_banned = TRUE,
-             ban_reason = $1,
-             ban_expires_at = $2,
-             banned_at = NOW()
-         WHERE id = $3
-         RETURNING *`,
-        [reason, expiresAt, req.params.id]
-      );
-
-      if (!result.rows[0]) {
-        return res.status(404).json({
-          error: "بازیکن پیدا نشد."
-        });
-      }
-
-      res.json({
-        success: true,
-        player: publicPlayer(result.rows[0])
-      });
-    } catch (error) {
-      next(error);
-    }
-  }
-);
-
-// --------------------------------------------------
-// ADMIN: UNBAN PLAYER
-// --------------------------------------------------
-
-app.post(
-  "/api/admin/players/:id/unban",
-  requireAuth,
-  requireAdmin,
-  async (req, res, next) => {
-    try {
-      const result = await pool.query(
-        `UPDATE players
-         SET is_banned = FALSE,
-             ban_reason = NULL,
-             ban_expires_at = NULL,
-             banned_at = NULL
-         WHERE id = $1
-         RETURNING *`,
-        [req.params.id]
-      );
-
-      if (!result.rows[0]) {
-        return res.status(404).json({
-          error: "بازیکن پیدا نشد."
-        });
-      }
-
-      res.json({
-        success: true,
-        player: publicPlayer(result.rows[0])
-      });
-    } catch (error) {
-      next(error);
-    }
-  }
-);
-
-// --------------------------------------------------
-// ADMIN: CREATE OR UPDATE REWARD CODE
-// --------------------------------------------------
-
-app.post(
-  "/api/admin/reward-codes",
-  requireAuth,
-  requireAdmin,
-  async (req, res, next) => {
-    try {
-      const code = normalizeRewardCode(req.body.code);
-      const coins = Number(req.body.coins);
-      const maxUses = Number(req.body.maxUses ?? 0);
-
-      let expiresAt = null;
-
-      if (req.body.expiresAt) {
-        expiresAt = new Date(req.body.expiresAt);
-
-        if (
-          Number.isNaN(expiresAt.getTime()) ||
-          expiresAt.getTime() <= Date.now()
-        ) {
-          return res.status(400).json({
-            error: "تاریخ انقضا باید معتبر و در آینده باشد."
+            error: "مقدار باید بین ۰ تا ۱۰۰ باشد."
           });
         }
       }
+
+      values.push(value);
+      updates.push(`${fields[key]} = $${values.length}`);
+    }
+
+    if (!updates.length) {
+      return res.status(400).json({
+        error: "مقداری برای تغییر ارسال نشده است."
+      });
+    }
+
+    values.push(req.params.id);
+
+    const syncParts = [];
+
+    if (Object.prototype.hasOwnProperty.call(req.body, "coins")) {
+      syncParts.push("'coins', coins");
+    }
+
+    if (Object.prototype.hasOwnProperty.call(req.body, "level")) {
+      syncParts.push("'level', level");
+    }
+
+    if (Object.prototype.hasOwnProperty.call(req.body, "hunger")) {
+      syncParts.push("'hunger', hunger");
+    }
+
+    if (Object.prototype.hasOwnProperty.call(req.body, "energy")) {
+      syncParts.push("'energy', energy");
+    }
+
+    if (Object.prototype.hasOwnProperty.call(req.body, "displayName")) {
+      syncParts.push("'playerName', display_name");
+    }
+
+    const result = await pool.query(
+      `UPDATE players SET ${updates.join(", ")},
+       game_data = COALESCE(game_data, '{}'::jsonb) ||
+         jsonb_build_object(${syncParts.join(", ")})
+       WHERE id = $${values.length} RETURNING *`,
+      values
+    );
+
+    if (!result.rows[0]) {
+      return res.status(404).json({
+        error: "بازیکن پیدا نشد."
+      });
+    }
+
+    res.json({
+      player: publicPlayer(result.rows[0])
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Admin: temporarily or permanently ban a player.
+app.post("/api/admin/players/:id/ban", requireAuth, requireAdmin, async (req, res, next) => {
+  try {
+    const reason = String(req.body.reason || "").trim();
+    const type = String(req.body.type || "");
+
+    if (!reason || reason.length > 500) {
+      return res.status(400).json({
+        error: "دلیل مسدودسازی باید بین ۱ تا ۵۰۰ نویسه باشد."
+      });
+    }
+
+    let expiresAt = null;
+
+    if (type === "temporary") {
+      const durationHours = Number(req.body.durationHours);
 
       if (
-        !/^[\p{L}\p{N}_-]{3,64}$/u.test(code) ||
-        !Number.isSafeInteger(coins) ||
-        coins < 0 ||
-        !Number.isSafeInteger(maxUses) ||
-        maxUses < 0 ||
-        maxUses > 2147483647
+        !Number.isFinite(durationHours) ||
+        durationHours <= 0 ||
+        durationHours > 8760
       ) {
         return res.status(400).json({
-          error: "اطلاعات کد جایزه معتبر نیست."
+          error: "مدت مسدودسازی باید بیشتر از صفر و حداکثر ۳۶۵ روز باشد."
         });
       }
 
-      const result = await pool.query(
-        `INSERT INTO reward_codes
-         (code, coins, active, expires_at, max_uses)
-         VALUES ($1, $2, TRUE, $3, $4)
-         ON CONFLICT (code) DO UPDATE
-         SET coins = EXCLUDED.coins,
-             active = TRUE,
-             expires_at = EXCLUDED.expires_at,
-             max_uses = EXCLUDED.max_uses
-         RETURNING id, code, coins, active,
-                   created_at, expires_at, max_uses`,
-        [code, coins, expiresAt, maxUses]
+      expiresAt = new Date(
+        Date.now() + durationHours * 60 * 60 * 1000
       );
-
-      res.status(201).json({
-        success: true,
-        rewardCode: result.rows[0]
+    } else if (type !== "permanent") {
+      return res.status(400).json({
+        error: "نوع مسدودسازی معتبر نیست."
       });
-    } catch (error) {
-      next(error);
     }
-  }
-);
 
-// --------------------------------------------------
-// ADMIN: LIST REWARD CODES
-// --------------------------------------------------
+    const result = await pool.query(
+      `UPDATE players
+       SET is_banned = TRUE,
+           ban_reason = $1,
+           ban_expires_at = $2,
+           banned_at = NOW()
+       WHERE id = $3
+       RETURNING *`,
+      [reason, expiresAt, req.params.id]
+    );
 
-app.get(
-  "/api/admin/reward-codes",
-  requireAuth,
-  requireAdmin,
-  async (req, res, next) => {
-    try {
-      const result = await pool.query(`
-        SELECT
-          rc.id,
-          rc.code,
-          rc.coins,
-          rc.active,
-          rc.created_at,
-          rc.expires_at,
-          rc.max_uses,
-
-          COUNT(rr.player_id)::INTEGER AS used_count,
-
-          CASE
-            WHEN rc.max_uses = 0 THEN NULL
-            ELSE GREATEST(
-              rc.max_uses - COUNT(rr.player_id)::INTEGER,
-              0
-            )
-          END AS remaining_uses
-
-        FROM reward_codes rc
-
-        LEFT JOIN reward_redemptions rr
-          ON rr.code_id = rc.id
-
-        GROUP BY rc.id
-        ORDER BY rc.id DESC
-      `);
-
-      res.json({
-        rewardCodes: result.rows
+    if (!result.rows[0]) {
+      return res.status(404).json({
+        error: "بازیکن پیدا نشد."
       });
-    } catch (error) {
-      next(error);
     }
+
+    res.json({
+      success: true,
+      player: publicPlayer(result.rows[0])
+    });
+  } catch (error) {
+    next(error);
   }
-);
+});
 
-// --------------------------------------------------
-// ADMIN: ACTIVATE / DEACTIVATE REWARD CODE
-// --------------------------------------------------
+// Admin: unban a player
+app.post("/api/admin/players/:id/unban", requireAuth, requireAdmin, async (req, res, next) => {
+  try {
+    const result = await pool.query(
+      `UPDATE players
+       SET is_banned = FALSE,
+           ban_reason = NULL,
+           ban_expires_at = NULL,
+           banned_at = NULL
+       WHERE id = $1
+       RETURNING *`,
+      [req.params.id]
+    );
 
-app.patch(
-  "/api/admin/reward-codes/:id",
-  requireAuth,
-  requireAdmin,
-  async (req, res, next) => {
-    try {
-      if (typeof req.body.active !== "boolean") {
-        return res.status(400).json({
-          error: "وضعیت فعال بودن معتبر نیست."
-        });
-      }
-
-      const result = await pool.query(
-        `UPDATE reward_codes
-         SET active = $1
-         WHERE id = $2
-         RETURNING id, code, coins, active,
-                   created_at, expires_at, max_uses`,
-        [req.body.active, req.params.id]
-      );
-
-      if (!result.rows[0]) {
-        return res.status(404).json({
-          error: "کد پیدا نشد."
-        });
-      }
-
-      res.json({
-        success: true,
-        rewardCode: result.rows[0]
+    if (!result.rows[0]) {
+      return res.status(404).json({
+        error: "بازیکن پیدا نشد."
       });
-    } catch (error) {
-      next(error);
     }
+
+    res.json({
+      success: true,
+      player: publicPlayer(result.rows[0])
+    });
+  } catch (error) {
+    next(error);
   }
-);
+});
 
-// --------------------------------------------------
-// PLAYER: REDEEM REWARD CODE
-// --------------------------------------------------
+// Admin: create or update a reward code
+app.post("/api/admin/reward-codes", requireAuth, requireAdmin, async (req, res, next) => {
+  try {
+    const code = normalizeRewardCode(req.body.code);
+    const coins = Number(req.body.coins);
+    const maxUses = Number(req.body.maxUses ?? 0);
 
-app.post(
-  "/api/redeem",
-  requireAuth,
-  requireActivePlayer,
-  async (req, res, next) => {
-    let client;
+    let expiresAt = null;
 
-    try {
-      const code = normalizeRewardCode(req.body.code);
-
-      if (!/^[\p{L}\p{N}_-]{3,64}$/u.test(code)) {
-        return res.status(400).json({
-          error: "کد معتبر نیست."
-        });
-      }
-
-      client = await pool.connect();
-      await client.query("BEGIN");
-
-      const codeResult = await client.query(
-        `SELECT *
-         FROM reward_codes
-         WHERE code = $1
-         FOR UPDATE`,
-        [code]
-      );
-
-      const reward = codeResult.rows[0];
-
-      if (!reward) {
-        await client.query("ROLLBACK");
-
-        return res.status(404).json({
-          error: "کد جایزه پیدا نشد."
-        });
-      }
-
-      if (!reward.active) {
-        await client.query("ROLLBACK");
-
-        return res.status(410).json({
-          error: "این کد جایزه غیرفعال شده است."
-        });
-      }
+    if (req.body.expiresAt) {
+      expiresAt = new Date(req.body.expiresAt);
 
       if (
-        reward.expires_at &&
-        new Date(reward.expires_at).getTime() <= Date.now()
+        Number.isNaN(expiresAt.getTime()) ||
+        expiresAt.getTime() <= Date.now()
       ) {
-        await client.query("ROLLBACK");
-
-        return res.status(410).json({
-          error: "مهلت استفاده از این کد به پایان رسیده است."
+        return res.status(400).json({
+          error: "تاریخ انقضا باید معتبر و در آینده باشد."
         });
       }
+    }
 
-      const previousUse = await client.query(
-        `SELECT 1
+    if (
+      !/^[\p{L}\p{N}_-]{3,64}$/u.test(code) ||
+      !Number.isSafeInteger(coins) ||
+      coins < 0 ||
+      !Number.isSafeInteger(maxUses) ||
+      maxUses < 0 ||
+      maxUses > 2147483647
+    ) {
+      return res.status(400).json({
+        error: "اطلاعات کد جایزه معتبر نیست."
+      });
+    }
+
+    const result = await pool.query(
+      `INSERT INTO reward_codes
+       (code, coins, active, expires_at, max_uses)
+       VALUES ($1, $2, TRUE, $3, $4)
+       ON CONFLICT (code) DO UPDATE
+       SET coins = EXCLUDED.coins,
+           active = TRUE,
+           expires_at = EXCLUDED.expires_at,
+           max_uses = EXCLUDED.max_uses
+       RETURNING id, code, coins, active, created_at,
+                 expires_at, max_uses`,
+      [code, coins, expiresAt, maxUses]
+    );
+
+    res.status(201).json({
+      rewardCode: result.rows[0]
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Admin: list reward codes with usage information
+app.get("/api/admin/reward-codes", requireAuth, requireAdmin, async (req, res, next) => {
+  try {
+    const result = await pool.query(`
+      SELECT
+        rc.id,
+        rc.code,
+        rc.coins,
+        rc.active,
+        rc.created_at,
+        rc.expires_at,
+        rc.max_uses,
+        COUNT(rr.player_id)::INTEGER AS used_count,
+        CASE
+          WHEN rc.max_uses = 0 THEN NULL
+          ELSE GREATEST(
+            rc.max_uses - COUNT(rr.player_id)::INTEGER,
+            0
+          )
+        END AS remaining_uses
+      FROM reward_codes rc
+      LEFT JOIN reward_redemptions rr
+        ON rr.code_id = rc.id
+      GROUP BY rc.id
+      ORDER BY rc.id DESC
+    `);
+
+    res.json({
+      rewardCodes: result.rows
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Admin: activate or deactivate a reward code
+app.patch("/api/admin/reward-codes/:id", requireAuth, requireAdmin, async (req, res, next) => {
+  try {
+    if (typeof req.body.active !== "boolean") {
+      return res.status(400).json({
+        error: "وضعیت فعال بودن معتبر نیست."
+      });
+    }
+
+    const result = await pool.query(
+      `UPDATE reward_codes
+       SET active = $1
+       WHERE id = $2
+       RETURNING id, code, coins, active, created_at,
+                 expires_at, max_uses`,
+      [req.body.active, req.params.id]
+    );
+
+    if (!result.rows[0]) {
+      return res.status(404).json({
+        error: "کد پیدا نشد."
+      });
+    }
+
+    res.json({
+      rewardCode: result.rows[0]
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Player: redeem a reward code once per account.
+app.post("/api/redeem", requireAuth, requireActivePlayer, async (req, res, next) => {
+  let client;
+
+  try {
+    if (req.auth.role !== "player") {
+      return res.status(403).json({
+        error: "حساب بازیکن لازم است."
+      });
+    }
+
+    const code = normalizeRewardCode(req.body.code);
+
+    if (!/^[\p{L}\p{N}_-]{3,64}$/u.test(code)) {
+      return res.status(400).json({
+        error: "کد معتبر نیست."
+      });
+    }
+
+    client = await pool.connect();
+    await client.query("BEGIN");
+
+    const codeResult = await client.query(
+      `SELECT *
+       FROM reward_codes
+       WHERE code = $1
+       FOR UPDATE`,
+      [code]
+    );
+
+    const reward = codeResult.rows[0];
+
+    if (!reward) {
+      await client.query("ROLLBACK");
+
+      return res.status(404).json({
+        error: "کد جایزه پیدا نشد؛ کد را بررسی کنید."
+      });
+    }
+
+    if (!reward.active) {
+      await client.query("ROLLBACK");
+
+      return res.status(410).json({
+        error: "این کد جایزه غیرفعال شده است."
+      });
+    }
+
+    if (
+      reward.expires_at &&
+      new Date(reward.expires_at).getTime() <= Date.now()
+    ) {
+      await client.query("ROLLBACK");
+
+      return res.status(410).json({
+        error: "مهلت استفاده از این کد جایزه به پایان رسیده است."
+      });
+    }
+
+    const previousUse = await client.query(
+      `SELECT 1
+       FROM reward_redemptions
+       WHERE player_id = $1 AND code_id = $2`,
+      [req.auth.sub, reward.id]
+    );
+
+    if (previousUse.rowCount > 0) {
+      await client.query("ROLLBACK");
+
+      return res.status(409).json({
+        error: "این کد قبلاً توسط شما استفاده شده است."
+      });
+    }
+
+    if (reward.max_uses > 0) {
+      const usageResult = await client.query(
+        `SELECT COUNT(*)::INTEGER AS used_count
          FROM reward_redemptions
-         WHERE player_id = $1 AND code_id = $2`,
-        [req.auth.sub, reward.id]
+         WHERE code_id = $1`,
+        [reward.id]
       );
 
-      if (previousUse.rowCount > 0) {
+      const usedCount = usageResult.rows[0].used_count;
+
+      if (usedCount >= reward.max_uses) {
         await client.query("ROLLBACK");
 
         return res.status(409).json({
-          error: "این کد قبلاً توسط شما استفاده شده است."
+          error: "ظرفیت استفاده از این کد جایزه تکمیل شده است."
         });
-      }
-
-      if (reward.max_uses > 0) {
-        const usageResult = await client.query(
-          `SELECT COUNT(*)::INTEGER AS used_count
-           FROM reward_redemptions
-           WHERE code_id = $1`,
-          [reward.id]
-        );
-
-        if (
-          usageResult.rows[0].used_count >= reward.max_uses
-        ) {
-          await client.query("ROLLBACK");
-
-          return res.status(409).json({
-            error: "ظرفیت استفاده از این کد تکمیل شده است."
-          });
-        }
-      }
-
-      const used = await client.query(
-        `INSERT INTO reward_redemptions
-         (player_id, code_id)
-         VALUES ($1, $2)
-         ON CONFLICT DO NOTHING
-         RETURNING player_id`,
-        [req.auth.sub, reward.id]
-      );
-
-      if (!used.rowCount) {
-        await client.query("ROLLBACK");
-
-        return res.status(409).json({
-          error: "این کد قبلاً استفاده شده است."
-        });
-      }
-
-      const playerResult = await client.query(
-        `UPDATE players
-         SET coins = coins + $1,
-             game_data =
-               COALESCE(game_data, '{}'::jsonb)
-               || jsonb_build_object(
-                 'coins', coins + $1
-               )
-         WHERE id = $2
-         RETURNING coins`,
-        [reward.coins, req.auth.sub]
-      );
-
-      if (!playerResult.rows[0]) {
-        await client.query("ROLLBACK");
-
-        return res.status(404).json({
-          error: "حساب بازیکن پیدا نشد."
-        });
-      }
-
-      await client.query("COMMIT");
-
-      res.json({
-        success: true,
-        coinsAwarded: Number(reward.coins),
-        totalCoins: Number(playerResult.rows[0].coins)
-      });
-
-    } catch (error) {
-      if (client) {
-        await client.query("ROLLBACK").catch(() => {});
-      }
-
-      next(error);
-    } finally {
-      if (client) {
-        client.release();
       }
     }
+
+    const used = await client.query(
+      `INSERT INTO reward_redemptions (player_id, code_id)
+       VALUES ($1, $2)
+       ON CONFLICT DO NOTHING
+       RETURNING player_id`,
+      [req.auth.sub, reward.id]
+    );
+
+    if (!used.rowCount) {
+      await client.query("ROLLBACK");
+
+      return res.status(409).json({
+        error: "این کد قبلاً توسط شما استفاده شده است."
+      });
+    }
+
+    const playerResult = await client.query(
+      `UPDATE players
+       SET coins = coins + $1,
+           game_data = COALESCE(game_data, '{}'::jsonb) ||
+             jsonb_build_object('coins', coins + $1)
+       WHERE id = $2
+       RETURNING coins`,
+      [reward.coins, req.auth.sub]
+    );
+
+    if (!playerResult.rows[0]) {
+      await client.query("ROLLBACK");
+
+      return res.status(404).json({
+        error: "حساب بازیکن پیدا نشد."
+      });
+    }
+
+    await client.query("COMMIT");
+
+    res.json({
+      success: true,
+      coinsAwarded: reward.coins,
+      totalCoins: playerResult.rows[0].coins
+    });
+
+  } catch (error) {
+    if (client) {
+      await client.query("ROLLBACK").catch(() => {});
+    }
+
+    next(error);
+  } finally {
+    if (client) {
+      client.release();
+    }
   }
-);
+});
 
-// --------------------------------------------------
-// ERROR HANDLER
-// --------------------------------------------------
-
+// Central error handler
 app.use((err, req, res, next) => {
-  console.error("Request failed:", err);
+  console.error("Request failed:", err.message);
 
   res.status(500).json({
     error: "خطای داخلی سرور رخ داد."
   });
 });
 
-// --------------------------------------------------
-// START SERVER
-// --------------------------------------------------
-
+// Start server after database initialization.
 initializeDatabase()
   .then(() => {
     app.listen(PORT, "0.0.0.0", () => {
-      console.log(
-        `Bozorgshahr server listening on ${PORT}`
-      );
+      console.log(`Bozorgshahr server listening on ${PORT}`);
     });
   })
   .catch((error) => {
     console.error(
       "Database initialization failed:",
-      error
+      error.message
     );
 
     process.exit(1);
