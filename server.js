@@ -67,6 +67,7 @@ async function initializeDatabase() {
       ADD COLUMN IF NOT EXISTS ban_expires_at TIMESTAMPTZ,
       ADD COLUMN IF NOT EXISTS banned_at TIMESTAMPTZ;
 
+    -- New reward-code features. Existing codes remain unlimited.
     ALTER TABLE reward_codes
       ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ,
       ADD COLUMN IF NOT EXISTS max_uses INTEGER NOT NULL DEFAULT 0;
@@ -85,86 +86,50 @@ function createToken(user) {
   );
 }
 
+// Authentication: keep the account session even while the player is banned.
 async function requireAuth(req, res, next) {
   const header = req.headers.authorization || "";
   const token = header.startsWith("Bearer ") ? header.slice(7) : "";
-
   try {
     if (!token) throw new Error("Missing token");
-
     req.auth = jwt.verify(token, JWT_SECRET);
     next();
   } catch (error) {
-    if (
-      error.name === "JsonWebTokenError" ||
-      error.name === "TokenExpiredError" ||
-      error.message === "Missing token"
-    ) {
-      return res.status(401).json({
-        error: "لطفاً دوباره وارد حساب شوید."
-      });
+    if (error.name === "JsonWebTokenError" || error.name === "TokenExpiredError" || error.message === "Missing token") {
+      return res.status(401).json({ error: "لطفاً دوباره وارد حساب شوید." });
     }
-
     next(error);
   }
 }
 
+// Banned players can inspect their account, but cannot play or redeem rewards.
 async function requireActivePlayer(req, res, next) {
   try {
-    if (req.auth?.role !== "player") {
-      return res.status(403).json({
-        error: "حساب بازیکن لازم است."
-      });
-    }
-
+    if (req.auth?.role !== "player") return res.status(403).json({ error: "حساب بازیکن لازم است." });
     const result = await pool.query(
-      "SELECT * FROM players WHERE id = $1",
+      "SELECT is_banned, ban_reason, ban_expires_at FROM players WHERE id = $1",
       [req.auth.sub]
     );
-
     const player = result.rows[0];
-
-    if (!player) {
-      return res.status(401).json({
-        error: "حساب بازیکن پیدا نشد."
-      });
-    }
-
-    if (
-      player.is_banned &&
-      player.ban_expires_at &&
-      new Date(player.ban_expires_at).getTime() <= Date.now()
-    ) {
+    if (!player) return res.status(401).json({ error: "حساب بازیکن پیدا نشد." });
+    if (player.is_banned && player.ban_expires_at && new Date(player.ban_expires_at).getTime() <= Date.now()) {
       await pool.query(
-        `UPDATE players
-         SET is_banned = FALSE,
-             ban_reason = NULL,
-             ban_expires_at = NULL,
-             banned_at = NULL
-         WHERE id = $1`,
+        `UPDATE players SET is_banned = FALSE, ban_reason = NULL, ban_expires_at = NULL, banned_at = NULL WHERE id = $1`,
         [req.auth.sub]
       );
-
       return next();
     }
-
     if (player.is_banned) {
       return res.status(403).json({
         error: "حساب شما مسدود شده است.",
         banned: true,
         banType: player.ban_expires_at ? "temporary" : "permanent",
         reason: player.ban_reason || "دلیلی ثبت نشده است.",
-        banReason: player.ban_reason || "دلیلی ثبت نشده است.",
-        expiresAt: player.ban_expires_at,
-        banExpiresAt: player.ban_expires_at,
-        player: publicPlayer(player)
+        expiresAt: player.ban_expires_at
       });
     }
-
     next();
-  } catch (error) {
-    next(error);
-  }
+  } catch (error) { next(error); }
 }
 
 function requireAdmin(req, res, next) {
@@ -389,48 +354,52 @@ app.get("/api/me", requireAuth, async (req, res, next) => {
   }
 });
 
-// Save game progress; coins and level are server-controlled.
+// Save game progress. The server persists the current live values so admin-set
+// values are starting values, not permanent locks. Existing game_data keys are merged
+// to protect owned phones and other collections when a client omits them.
 app.put("/api/me/game-data", requireAuth, requireActivePlayer, async (req, res, next) => {
   try {
     if (req.auth.role !== "player") {
-      return res.status(403).json({
-        error: "حساب بازیکن لازم است."
-      });
+      return res.status(403).json({ error: "حساب بازیکن لازم است." });
     }
 
     const gameData = req.body.gameData;
-
-    if (
-      !gameData ||
-      typeof gameData !== "object" ||
-      Array.isArray(gameData)
-    ) {
-      return res.status(400).json({
-        error: "اطلاعات بازی معتبر نیست."
-      });
+    if (!gameData || typeof gameData !== "object" || Array.isArray(gameData)) {
+      return res.status(400).json({ error: "اطلاعات بازی معتبر نیست." });
     }
+
+    const intValue = (key, min, max = Number.MAX_SAFE_INTEGER) => {
+      if (!Object.prototype.hasOwnProperty.call(gameData, key)) return null;
+      const n = Number(gameData[key]);
+      if (!Number.isFinite(n)) return null;
+      return Math.min(max, Math.max(min, Math.round(n)));
+    };
+
+    const coins = intValue("coins", 0);
+    const level = intValue("level", 1);
+    const hunger = intValue("hunger", 0, 100);
+    const energy = intValue("energy", 0, 100);
+    const playerName = typeof gameData.playerName === "string"
+      ? gameData.playerName.trim().replace(/\s+/g, " ").slice(0, 18)
+      : "";
 
     const result = await pool.query(
       `UPDATE players SET
-         game_data = COALESCE(game_data, '{}'::jsonb) ||
-           ($1::jsonb - 'coins' - 'level') ||
-           jsonb_build_object('coins', coins, 'level', level),
-         hunger = CASE WHEN ($1::jsonb ? 'hunger') AND ($1::jsonb->>'hunger') ~ '^-?\d+$' THEN LEAST(100, GREATEST(0, (($1::jsonb->>'hunger')::integer))) ELSE hunger END,
-         energy = CASE WHEN ($1::jsonb ? 'energy') AND ($1::jsonb->>'energy') ~ '^-?\d+$' THEN LEAST(100, GREATEST(0, (($1::jsonb->>'energy')::integer))) ELSE energy END,
-         display_name = CASE WHEN ($1::jsonb ? 'playerName') AND length(trim($1::jsonb->>'playerName')) BETWEEN 1 AND 40 THEN trim($1::jsonb->>'playerName') ELSE display_name END
-       WHERE id = $2 RETURNING *`,
-      [JSON.stringify(gameData), req.auth.sub]
+         game_data = COALESCE(game_data, '{}'::jsonb) || $1::jsonb,
+         coins = COALESCE($2::bigint, coins),
+         level = COALESCE($3::integer, level),
+         hunger = COALESCE($4::integer, hunger),
+         energy = COALESCE($5::integer, energy),
+         display_name = CASE WHEN length($6) BETWEEN 1 AND 40 THEN $6 ELSE display_name END
+       WHERE id = $7 RETURNING *`,
+      [JSON.stringify(gameData), coins, level, hunger, energy, playerName, req.auth.sub]
     );
 
     if (!result.rows[0]) {
-      return res.status(404).json({
-        error: "بازیکن پیدا نشد."
-      });
+      return res.status(404).json({ error: "بازیکن پیدا نشد." });
     }
 
-    res.json({
-      player: publicPlayer(result.rows[0])
-    });
+    res.json({ player: publicPlayer(result.rows[0]) });
   } catch (error) {
     next(error);
   }
@@ -582,33 +551,10 @@ app.patch("/api/admin/players/:id", requireAuth, requireAdmin, async (req, res, 
 
     values.push(req.params.id);
 
-    const syncParts = [];
-
-    if (Object.prototype.hasOwnProperty.call(req.body, "coins")) {
-      syncParts.push("'coins', coins");
-    }
-
-    if (Object.prototype.hasOwnProperty.call(req.body, "level")) {
-      syncParts.push("'level', level");
-    }
-
-    if (Object.prototype.hasOwnProperty.call(req.body, "hunger")) {
-      syncParts.push("'hunger', hunger");
-    }
-
-    if (Object.prototype.hasOwnProperty.call(req.body, "energy")) {
-      syncParts.push("'energy', energy");
-    }
-
-    if (Object.prototype.hasOwnProperty.call(req.body, "displayName")) {
-      syncParts.push("'playerName', display_name");
-    }
-
     const result = await pool.query(
-      `UPDATE players SET ${updates.join(", ")},
-       game_data = COALESCE(game_data, '{}'::jsonb) ||
-         jsonb_build_object(${syncParts.join(", ")})
-       WHERE id = $${values.length} RETURNING *`,
+      `UPDATE players SET ${updates.join(", ")}
+       WHERE id = $${values.length}
+       RETURNING *`,
       values
     );
 
@@ -618,9 +564,19 @@ app.patch("/api/admin/players/:id", requireAuth, requireAdmin, async (req, res, 
       });
     }
 
-    res.json({
-      player: publicPlayer(result.rows[0])
-    });
+    const p = result.rows[0];
+    const syncData = {};
+    if (Object.prototype.hasOwnProperty.call(req.body, "coins")) syncData.coins = p.coins;
+    if (Object.prototype.hasOwnProperty.call(req.body, "level")) syncData.level = p.level;
+    if (Object.prototype.hasOwnProperty.call(req.body, "hunger")) syncData.hunger = p.hunger;
+    if (Object.prototype.hasOwnProperty.call(req.body, "energy")) syncData.energy = p.energy;
+    if (Object.prototype.hasOwnProperty.call(req.body, "displayName")) syncData.playerName = p.display_name;
+    const synced = await pool.query(
+      `UPDATE players SET game_data = COALESCE(game_data, '{}'::jsonb) || $1::jsonb
+       WHERE id = $2 RETURNING *`,
+      [JSON.stringify(syncData), req.params.id]
+    );
+    res.json({ player: publicPlayer(synced.rows[0]) });
   } catch (error) {
     next(error);
   }
@@ -863,10 +819,11 @@ app.post("/api/redeem", requireAuth, requireActivePlayer, async (req, res, next)
     client = await pool.connect();
     await client.query("BEGIN");
 
+    // Lock the reward code so simultaneous requests cannot exceed its limit.
     const codeResult = await client.query(
       `SELECT *
        FROM reward_codes
-       WHERE code = $1
+       WHERE code = $1 AND active = TRUE
        FOR UPDATE`,
       [code]
     );
@@ -877,18 +834,11 @@ app.post("/api/redeem", requireAuth, requireActivePlayer, async (req, res, next)
       await client.query("ROLLBACK");
 
       return res.status(404).json({
-        error: "کد جایزه پیدا نشد؛ کد را بررسی کنید."
+        error: "کد جایزه معتبر نیست."
       });
     }
 
-    if (!reward.active) {
-      await client.query("ROLLBACK");
-
-      return res.status(410).json({
-        error: "این کد جایزه غیرفعال شده است."
-      });
-    }
-
+    // Check expiration.
     if (
       reward.expires_at &&
       new Date(reward.expires_at).getTime() <= Date.now()
@@ -900,6 +850,7 @@ app.post("/api/redeem", requireAuth, requireActivePlayer, async (req, res, next)
       });
     }
 
+    // Each player can redeem the same code only once.
     const previousUse = await client.query(
       `SELECT 1
        FROM reward_redemptions
@@ -915,6 +866,7 @@ app.post("/api/redeem", requireAuth, requireActivePlayer, async (req, res, next)
       });
     }
 
+    // max_uses = 0 means unlimited use.
     if (reward.max_uses > 0) {
       const usageResult = await client.query(
         `SELECT COUNT(*)::INTEGER AS used_count
@@ -934,6 +886,7 @@ app.post("/api/redeem", requireAuth, requireActivePlayer, async (req, res, next)
       }
     }
 
+    // Record redemption.
     const used = await client.query(
       `INSERT INTO reward_redemptions (player_id, code_id)
        VALUES ($1, $2)
@@ -950,11 +903,10 @@ app.post("/api/redeem", requireAuth, requireActivePlayer, async (req, res, next)
       });
     }
 
+    // Add coins to the player.
     const playerResult = await client.query(
       `UPDATE players
-       SET coins = coins + $1,
-           game_data = COALESCE(game_data, '{}'::jsonb) ||
-             jsonb_build_object('coins', coins + $1)
+       SET coins = coins + $1
        WHERE id = $2
        RETURNING coins`,
       [reward.coins, req.auth.sub]
