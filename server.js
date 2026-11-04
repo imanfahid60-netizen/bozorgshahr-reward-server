@@ -565,7 +565,6 @@ app.get(
     }
   }
 );
-
 // Admin: edit a player's game values
 app.patch(
   "/api/admin/players/:id",
@@ -628,7 +627,18 @@ app.patch(
         values.push(value);
         updates.push(`${fields[key]} = $${values.length}`);
 
-        syncParts.push(`'${key === "displayName" ? "playerName" : key}', $${values.length}`);
+        const jsonType = {
+          displayName: "text",
+          coins: "bigint",
+          level: "integer",
+          score: "bigint",
+          hunger: "integer",
+          energy: "integer"
+        }[key];
+
+        syncParts.push(
+          `'${key === "displayName" ? "playerName" : key}', $${values.length}::${jsonType}`
+        );
       }
 
       if (!updates.length) {
@@ -725,6 +735,7 @@ app.patch(
     }
   }
 );
+
 // Admin: unban a player
 app.patch(
   "/api/admin/players/:id/unban",
