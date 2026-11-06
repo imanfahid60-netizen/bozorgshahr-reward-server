@@ -557,14 +557,14 @@ app.get(
         });
       }
 
-      res.json({
-        player: publicPlayer(result.rows[0])
+      res.json({        player: publicPlayer(result.rows[0])
       });
     } catch (error) {
       next(error);
     }
   }
 );
+
 // Admin: edit a player's game values
 app.patch(
   "/api/admin/players/:id",
@@ -625,7 +625,15 @@ app.patch(
         }
 
         values.push(value);
-        updates.push(`${fields[key]} = $${values.length}`);
+        const parameterIndex = values.length;
+
+        // The same parameter is used in a SQL column and in JSONB.
+        // Give both usages explicit types to avoid PostgreSQL 42P08.
+        if (key === "displayName") {
+          updates.push(`display_name = $${parameterIndex}::varchar(40)`);
+        } else {
+          updates.push(`${fields[key]} = $${parameterIndex}`);
+        }
 
         const jsonType = {
           displayName: "text",
@@ -637,7 +645,7 @@ app.patch(
         }[key];
 
         syncParts.push(
-          `'${key === "displayName" ? "playerName" : key}', $${values.length}::${jsonType}`
+          `'${key === "displayName" ? "playerName" : key}', $${parameterIndex}::${jsonType}`
         );
       }
 
@@ -658,14 +666,14 @@ app.patch(
           SET ${updates.join(", ")},
               game_data = COALESCE(game_data, '{}'::jsonb) ||
                 jsonb_build_object(${syncParts.join(", ")})
-          WHERE id = $${values.length}
+          WHERE id = $${values.length}::bigint
           RETURNING *
         `;
       } else {
         query = `
           UPDATE players
           SET ${updates.join(", ")}
-          WHERE id = $${values.length}
+          WHERE id = $${values.length}::bigint
           RETURNING *
         `;
       }
