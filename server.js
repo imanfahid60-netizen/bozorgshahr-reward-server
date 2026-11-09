@@ -28,7 +28,13 @@ const pool = new Pool({
     : { rejectUnauthorized: false }
 });
 
-// Initialize database without deleting existing data.
+// تنظیمات شرکت
+const WORK_MAX_USES = 20;
+const WORK_COOLDOWN_HOURS = 11;
+const WORK_REWARD_COINS = 50;
+const WORK_ENERGY_COST = 10;
+const WORK_SCORE_REWARD = 70;
+
 async function initializeDatabase() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS players (
@@ -70,6 +76,11 @@ async function initializeDatabase() {
     ALTER TABLE reward_codes
       ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ,
       ADD COLUMN IF NOT EXISTS max_uses INTEGER NOT NULL DEFAULT 0;
+
+    -- افزودن محدودیت شرکت بدون حذف اطلاعات قبلی
+    ALTER TABLE players
+      ADD COLUMN IF NOT EXISTS work_used INTEGER NOT NULL DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS work_reset_at TIMESTAMPTZ;
   `);
 }
 
@@ -87,10 +98,13 @@ function createToken(user) {
 
 async function requireAuth(req, res, next) {
   const header = req.headers.authorization || "";
-  const token = header.startsWith("Bearer ") ? header.slice(7) : "";
+  const token = header.startsWith("Bearer ")
+    ? header.slice(7)
+    : "";
 
   try {
     if (!token) throw new Error("Missing token");
+
     req.auth = jwt.verify(token, JWT_SECRET);
     next();
   } catch (error) {
@@ -103,6 +117,7 @@ async function requireAuth(req, res, next) {
         error: "لطفاً دوباره وارد حساب شوید."
       });
     }
+
     next(error);
   }
 }
@@ -116,7 +131,9 @@ async function requireActivePlayer(req, res, next) {
     }
 
     const result = await pool.query(
-      "SELECT is_banned, ban_reason, ban_expires_at FROM players WHERE id = $1",
+      `SELECT is_banned, ban_reason, ban_expires_at
+       FROM players
+       WHERE id = $1`,
       [req.auth.sub]
     );
 
@@ -142,6 +159,7 @@ async function requireActivePlayer(req, res, next) {
          WHERE id = $1`,
         [req.auth.sub]
       );
+
       return next();
     }
 
@@ -149,12 +167,13 @@ async function requireActivePlayer(req, res, next) {
       return res.status(403).json({
         error: "حساب شما مسدود شده است.",
         banned: true,
-        banType: player.ban_expires_at ? "temporary" : "permanent",
+        banType: player.ban_expires_at
+          ? "temporary"
+          : "permanent",
         reason: player.ban_reason || "دلیلی ثبت نشده است.",
         banReason: player.ban_reason || "دلیلی ثبت نشده است.",
         expiresAt: player.ban_expires_at,
-        banExpiresAt: player.ban_expires_at,
-        player: publicPlayer(player)
+        banExpiresAt: player.ban_expires_at
       });
     }
 
@@ -190,7 +209,12 @@ function publicPlayer(player) {
     isBanned: player.is_banned || false,
     banReason: player.ban_reason || null,
     banExpiresAt: player.ban_expires_at || null,
-    bannedAt: player.banned_at || null
+    bannedAt: player.banned_at || null,
+
+    // اطلاعات محدودیت شرکت
+    workUsed: Number(player.work_used || 0),
+    workMaxUses: WORK_MAX_USES,
+    workResetAt: player.work_reset_at || null
   };
 }
 
@@ -213,7 +237,7 @@ app.get("/", (req, res) => {
   res.json({
     name: "Bozorgshahr Server",
     status: "online",
-    version: "1.3.0"
+    version: "2.0.0"
   });
 });
 
@@ -230,7 +254,7 @@ app.get("/health", async (req, res, next) => {
   }
 });
 
-// Player registration
+// ثبت نام بازیکن
 app.post("/api/register", async (req, res, next) => {
   try {
     const username = String(req.body.username || "")
@@ -292,7 +316,7 @@ app.post("/api/register", async (req, res, next) => {
   }
 });
 
-// Player login
+// ورود بازیکن
 app.post("/api/login", async (req, res, next) => {
   try {
     const username = String(req.body.username || "")
@@ -335,7 +359,7 @@ app.post("/api/login", async (req, res, next) => {
   }
 });
 
-// Admin login
+// ورود مدیر
 app.post("/api/admin/login", (req, res) => {
   const username = String(req.body.username || "");
   const password = String(req.body.password || "");
@@ -358,7 +382,7 @@ app.post("/api/admin/login", (req, res) => {
   });
 });
 
-// Current player's saved information
+// دریافت اطلاعات حساب
 app.get("/api/me", requireAuth, async (req, res, next) => {
   try {
     if (req.auth.role !== "player") {
@@ -385,8 +409,8 @@ app.get("/api/me", requireAuth, async (req, res, next) => {
     next(error);
   }
 });
-
-// Save live player progress
+// ذخیره اطلاعات عمومی بازی
+// مقادیر سکه، انرژی و امتیاز فقط از مسیرهای معتبر سرور تغییر می‌کنند.
 app.put(
   "/api/me/game-data",
   requireAuth,
@@ -411,65 +435,75 @@ app.put(
         });
       }
 
-      const intValue = (key, min, max = Number.MAX_SAFE_INTEGER) => {
-        if (!Object.prototype.hasOwnProperty.call(gameData, key)) {
-          return null;
-        }
-
-        const n = Number(gameData[key]);
-
-        if (!Number.isSafeInteger(n)) return null;
-
-        return Math.min(max, Math.max(min, n));
-      };
-
-      const coins = intValue("coins", 0);
-      const level = intValue("level", 1);
-      const hunger = intValue("hunger", 0, 100);
-      const energy = intValue("energy", 0, 100);
-
-      const playerName = typeof gameData.playerName === "string"
-        ? gameData.playerName.trim().replace(/\s+/g, " ").slice(0, 18)
-        : "";
-
       const cleanData = { ...gameData };
 
+      // جلوگیری از بازنویسی مقادیر اقتصادی توسط فایل بازی
       for (const key of [
         "coins",
-        "level",
-        "hunger",
         "energy",
-        "playerName"
+        "score",
+        "workUsed",
+        "workResetAt",
+        "work_used",
+        "work_reset_at"
       ]) {
         delete cleanData[key];
       }
 
+      const levelValue = Object.prototype.hasOwnProperty.call(
+        cleanData,
+        "level"
+      ) ? Number(cleanData.level) : null;
+
+      const hungerValue = Object.prototype.hasOwnProperty.call(
+        cleanData,
+        "hunger"
+      ) ? Number(cleanData.hunger) : null;
+
+      if (
+        levelValue !== null &&
+        (!Number.isSafeInteger(levelValue) || levelValue < 1)
+      ) {
+        return res.status(400).json({
+          error: "سطح بازیکن معتبر نیست."
+        });
+      }
+
+      if (
+        hungerValue !== null &&
+        (!Number.isSafeInteger(hungerValue) ||
+          hungerValue < 0 ||
+          hungerValue > 100)
+      ) {
+        return res.status(400).json({
+          error: "مقدار گرسنگی معتبر نیست."
+        });
+      }
+
+      const playerName = typeof cleanData.playerName === "string"
+        ? cleanData.playerName.trim()
+            .replace(/\s+/g, " ")
+            .slice(0, 18)
+        : "";
+
+      delete cleanData.playerName;
+
       const result = await pool.query(
-        `UPDATE players SET
-           game_data = COALESCE(game_data, '{}'::jsonb) || $1::jsonb ||
-             jsonb_strip_nulls(jsonb_build_object(
-               'coins', $2::bigint,
-               'level', $3::integer,
-               'hunger', $4::integer,
-               'energy', $5::integer,
-               'playerName', NULLIF($6, '')
-             )),
-           coins = COALESCE($2::bigint, coins),
-           level = COALESCE($3::integer, level),
-           hunger = COALESCE($4::integer, hunger),
-           energy = COALESCE($5::integer, energy),
-           display_name = CASE
-             WHEN length($6) BETWEEN 1 AND 18 THEN $6
-             ELSE display_name
-           END
-         WHERE id = $7
+        `UPDATE players
+         SET game_data =
+               COALESCE(game_data, '{}'::jsonb) || $1::jsonb,
+             level = COALESCE($2::integer, level),
+             hunger = COALESCE($3::integer, hunger),
+             display_name = CASE
+               WHEN length($4) BETWEEN 1 AND 18 THEN $4
+               ELSE display_name
+             END
+         WHERE id = $5
          RETURNING *`,
         [
           JSON.stringify(cleanData),
-          coins,
-          level,
-          hunger,
-          energy,
+          levelValue,
+          hungerValue,
           playerName,
           req.auth.sub
         ]
@@ -490,7 +524,249 @@ app.put(
   }
 );
 
-// Admin: dashboard statistics
+// =====================================================
+// شرکت: انجام یک نوبت کار به صورت کاملاً کنترل‌شده در سرور
+// =====================================================
+
+app.post(
+  "/api/work/do",
+  requireAuth,
+  requireActivePlayer,
+  async (req, res, next) => {
+    const client = await pool.connect();
+    let transactionStarted = false;
+
+    try {
+      if (req.auth.role !== "player") {
+        return res.status(403).json({
+          error: "حساب بازیکن لازم است."
+        });
+      }
+
+      await client.query("BEGIN");
+      transactionStarted = true;
+
+      // قفل بازیکن برای جلوگیری از درخواست‌های هم‌زمان
+      const result = await client.query(
+        `SELECT *
+         FROM players
+         WHERE id = $1
+         FOR UPDATE`,
+        [req.auth.sub]
+      );
+
+      const player = result.rows[0];
+
+      if (!player) {
+        await client.query("ROLLBACK");
+        transactionStarted = false;
+
+        return res.status(404).json({
+          error: "بازیکن پیدا نشد."
+        });
+      }
+
+      const nowResult = await client.query(
+        "SELECT NOW() AS current_time"
+      );
+
+      const now = new Date(nowResult.rows[0].current_time);
+
+      let used = Number(player.work_used || 0);
+      let resetAt = player.work_reset_at
+        ? new Date(player.work_reset_at)
+        : null;
+
+      // اگر زمان محدودیت تمام شده باشد، سهمیه آزاد می‌شود.
+      if (
+        used >= WORK_MAX_USES &&
+        resetAt &&
+        resetAt.getTime() <= now.getTime()
+      ) {
+        used = 0;
+        resetAt = null;
+      }
+
+      // اگر محدودیت کامل شده و هنوز زمان آن تمام نشده باشد
+      if (
+        used >= WORK_MAX_USES &&
+        resetAt &&
+        resetAt.getTime() > now.getTime()
+      ) {
+        const remainingMs = resetAt.getTime() - now.getTime();
+
+        await client.query("ROLLBACK");
+        transactionStarted = false;
+
+        return res.status(429).json({
+          error: "سهمیه کار شما تکمیل شده است.",
+          code: "WORK_LIMIT_REACHED",
+          workUsed: WORK_MAX_USES,
+          workMaxUses: WORK_MAX_USES,
+          workRemaining: 0,
+          workResetAt: resetAt.toISOString(),
+          remainingMilliseconds: remainingMs
+        });
+      }
+
+      // محافظت در برابر وضعیت ناقص
+      if (used >= WORK_MAX_USES) {
+        used = 0;
+        resetAt = null;
+      }
+
+      const energy = Number(player.energy);
+
+      if (energy < WORK_ENERGY_COST) {
+        await client.query("ROLLBACK");
+        transactionStarted = false;
+
+        return res.status(400).json({
+          error: "انرژی کافی برای انجام کار ندارید.",
+          code: "NOT_ENOUGH_ENERGY",
+          energy,
+          requiredEnergy: WORK_ENERGY_COST,
+          workUsed: used,
+          workMaxUses: WORK_MAX_USES,
+          workRemaining: WORK_MAX_USES - used
+        });
+      }
+
+      const newUsed = used + 1;
+
+      // پس از بیستمین کار، محدودیت ۱۱ ساعته آغاز می‌شود.
+      const newResetAt = newUsed >= WORK_MAX_USES
+        ? new Date(
+            now.getTime() +
+            WORK_COOLDOWN_HOURS * 60 * 60 * 1000
+          )
+        : null;
+
+      const update = await client.query(
+        `UPDATE players
+         SET coins = coins + $1,
+             energy = energy - $2,
+             score = score + $3,
+             work_used = $4,
+             work_reset_at = $5,
+             game_data =
+               COALESCE(game_data, '{}'::jsonb) ||
+               jsonb_build_object(
+                 'workUsed', $4::integer,
+                 'workResetAt', $5::text
+               )
+         WHERE id = $6
+         RETURNING *`,
+        [
+          WORK_REWARD_COINS,
+          WORK_ENERGY_COST,
+          WORK_SCORE_REWARD,
+          newUsed,
+          newResetAt ? newResetAt.toISOString() : null,
+          req.auth.sub
+        ]
+      );
+
+      await client.query("COMMIT");
+      transactionStarted = false;
+
+      const updatedPlayer = update.rows[0];
+
+      res.json({
+        success: true,
+        message: "کار با موفقیت انجام شد.",
+        coinsAdded: WORK_REWARD_COINS,
+        energyUsed: WORK_ENERGY_COST,
+        scoreAdded: WORK_SCORE_REWARD,
+        workUsed: Number(updatedPlayer.work_used),
+        workMaxUses: WORK_MAX_USES,
+        workRemaining: Math.max(
+          0,
+          WORK_MAX_USES - Number(updatedPlayer.work_used)
+        ),
+        workResetAt: updatedPlayer.work_reset_at,
+        player: publicPlayer(updatedPlayer)
+      });
+    } catch (error) {
+      if (transactionStarted) {
+        await client.query("ROLLBACK").catch(() => {});
+      }
+
+      next(error);
+    } finally {
+      client.release();
+    }
+  }
+);
+
+// دریافت وضعیت فعلی سهمیه شرکت
+app.get(
+  "/api/work/status",
+  requireAuth,
+  requireActivePlayer,
+  async (req, res, next) => {
+    try {
+      const result = await pool.query(
+        `SELECT work_used, work_reset_at
+         FROM players
+         WHERE id = $1`,
+        [req.auth.sub]
+      );
+
+      if (!result.rows[0]) {
+        return res.status(404).json({
+          error: "بازیکن پیدا نشد."
+        });
+      }
+
+      let used = Number(result.rows[0].work_used || 0);
+      let resetAt = result.rows[0].work_reset_at
+        ? new Date(result.rows[0].work_reset_at)
+        : null;
+
+      const nowResult = await pool.query(
+        "SELECT NOW() AS current_time"
+      );
+
+      const now = new Date(nowResult.rows[0].current_time);
+
+      if (
+        used >= WORK_MAX_USES &&
+        resetAt &&
+        resetAt.getTime() <= now.getTime()
+      ) {
+        const reset = await pool.query(
+          `UPDATE players
+           SET work_used = 0,
+               work_reset_at = NULL,
+               game_data =
+                 COALESCE(game_data, '{}'::jsonb) ||
+                 '{"workUsed":0,"workResetAt":null}'::jsonb
+           WHERE id = $1
+           RETURNING work_used, work_reset_at`,
+          [req.auth.sub]
+        );
+
+        used = Number(reset.rows[0].work_used);
+        resetAt = null;
+      }
+
+      res.json({
+        workUsed: used,
+        workMaxUses: WORK_MAX_USES,
+        workRemaining: Math.max(0, WORK_MAX_USES - used),
+        workResetAt: resetAt ? resetAt.toISOString() : null
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+// =====================================================
+// مدیریت بازیکنان
+// =====================================================
+
 app.get(
   "/api/admin/stats",
   requireAuth,
@@ -510,16 +786,13 @@ app.get(
           ) AS active_reward_codes
       `);
 
-      res.json({
-        stats: result.rows[0]
-      });
+      res.json({ stats: result.rows[0] });
     } catch (error) {
       next(error);
     }
   }
 );
 
-// Admin: list players
 app.get(
   "/api/admin/players",
   requireAuth,
@@ -539,7 +812,6 @@ app.get(
   }
 );
 
-// Admin: search one player by username
 app.get(
   "/api/admin/players/:username",
   requireAuth,
@@ -557,7 +829,8 @@ app.get(
         });
       }
 
-      res.json({        player: publicPlayer(result.rows[0])
+      res.json({
+        player: publicPlayer(result.rows[0])
       });
     } catch (error) {
       next(error);
@@ -565,7 +838,6 @@ app.get(
   }
 );
 
-// Admin: edit a player's game values
 app.patch(
   "/api/admin/players/:id",
   requireAuth,
@@ -619,20 +891,19 @@ app.patch(
           }
 
           if (key === "level") value = Math.max(1, value);
+
           if (key === "hunger" || key === "energy") {
             value = Math.min(100, value);
           }
         }
 
         values.push(value);
-        const parameterIndex = values.length;
+        const index = values.length;
 
-        // The same parameter is used in a SQL column and in JSONB.
-        // Give both usages explicit types to avoid PostgreSQL 42P08.
         if (key === "displayName") {
-          updates.push(`display_name = $${parameterIndex}::varchar(40)`);
+          updates.push(`display_name = $${index}::varchar(40)`);
         } else {
-          updates.push(`${fields[key]} = $${parameterIndex}`);
+          updates.push(`${fields[key]} = $${index}`);
         }
 
         const jsonType = {
@@ -645,7 +916,7 @@ app.patch(
         }[key];
 
         syncParts.push(
-          `'${key === "displayName" ? "playerName" : key}', $${parameterIndex}::${jsonType}`
+          `'${key === "displayName" ? "playerName" : key}', $${index}::${jsonType}`
         );
       }
 
@@ -655,30 +926,18 @@ app.patch(
         });
       }
 
-      const id = req.params.id;
-      values.push(id);
+      values.push(req.params.id);
 
-      let query;
-
-      if (syncParts.length) {
-        query = `
-          UPDATE players
-          SET ${updates.join(", ")},
-              game_data = COALESCE(game_data, '{}'::jsonb) ||
-                jsonb_build_object(${syncParts.join(", ")})
-          WHERE id = $${values.length}::bigint
-          RETURNING *
-        `;
-      } else {
-        query = `
-          UPDATE players
-          SET ${updates.join(", ")}
-          WHERE id = $${values.length}::bigint
-          RETURNING *
-        `;
-      }
-
-      const result = await pool.query(query, values);
+      const result = await pool.query(
+        `UPDATE players
+         SET ${updates.join(", ")},
+             game_data =
+               COALESCE(game_data, '{}'::jsonb) ||
+               jsonb_build_object(${syncParts.join(", ")})
+         WHERE id = $${values.length}::bigint
+         RETURNING *`,
+        values
+      );
 
       if (!result.rows[0]) {
         return res.status(404).json({
@@ -695,7 +954,7 @@ app.patch(
   }
 );
 
-// Admin: ban or unban a player
+// مسدود یا آزادکردن بازیکن
 app.patch(
   "/api/admin/players/:id/ban",
   requireAuth,
@@ -703,13 +962,19 @@ app.patch(
   async (req, res, next) => {
     try {
       const banned = Boolean(req.body.banned);
-      const reason = String(req.body.reason || "").trim().slice(0, 500);
+      const reason = String(req.body.reason || "")
+        .trim()
+        .slice(0, 500);
+
       let expiresAt = null;
 
       if (banned && req.body.expiresAt) {
         const date = new Date(req.body.expiresAt);
 
-        if (Number.isNaN(date.getTime()) || date.getTime() <= Date.now()) {
+        if (
+          Number.isNaN(date.getTime()) ||
+          date.getTime() <= Date.now()
+        ) {
           return res.status(400).json({
             error: "زمان پایان مسدودیت معتبر نیست."
           });
@@ -721,9 +986,18 @@ app.patch(
       const result = await pool.query(
         `UPDATE players
          SET is_banned = $1,
-             ban_reason = CASE WHEN $1 THEN NULLIF($2, '') ELSE NULL END,
-             ban_expires_at = CASE WHEN $1 THEN $3::timestamptz ELSE NULL END,
-             banned_at = CASE WHEN $1 THEN NOW() ELSE NULL END
+             ban_reason = CASE
+               WHEN $1 THEN NULLIF($2, '')
+               ELSE NULL
+             END,
+             ban_expires_at = CASE
+               WHEN $1 THEN $3::timestamptz
+               ELSE NULL
+             END,
+             banned_at = CASE
+               WHEN $1 THEN NOW()
+               ELSE NULL
+             END
          WHERE id = $4
          RETURNING *`,
         [banned, reason, expiresAt, req.params.id]
@@ -744,7 +1018,6 @@ app.patch(
   }
 );
 
-// Admin: unban a player
 app.patch(
   "/api/admin/players/:id/unban",
   requireAuth,
@@ -777,7 +1050,10 @@ app.patch(
   }
 );
 
-// Admin: list reward codes
+// =====================================================
+// مدیریت کدهای جایزه
+// =====================================================
+
 app.get(
   "/api/admin/reward-codes",
   requireAuth,
@@ -796,16 +1072,13 @@ app.get(
         ORDER BY rc.created_at DESC
       `);
 
-      res.json({
-        codes: result.rows
-      });
+      res.json({ codes: result.rows });
     } catch (error) {
       next(error);
     }
   }
 );
 
-// Admin: create reward code
 app.post(
   "/api/admin/reward-codes",
   requireAuth,
@@ -834,7 +1107,7 @@ app.post(
 
       if (!/^[A-Z0-9_-]{3,64}$/.test(code)) {
         return res.status(400).json({
-          error: "کد باید بین ۳ تا ۶۴ نویسه و شامل حروف انگلیسی، عدد، خط تیره یا زیرخط باشد."
+          error: "کد جایزه معتبر نیست."
         });
       }
 
@@ -873,7 +1146,6 @@ app.post(
   }
 );
 
-// Admin: edit or deactivate reward code
 app.patch(
   "/api/admin/reward-codes/:id",
   requireAuth,
@@ -964,13 +1236,14 @@ app.patch(
   }
 );
 
-// Player: redeem reward code
+// ثبت کد جایزه توسط بازیکن
 app.post(
   "/api/redeem",
   requireAuth,
   requireActivePlayer,
   async (req, res, next) => {
     const client = await pool.connect();
+    let transactionStarted = false;
 
     try {
       if (req.auth.role !== "player") {
@@ -988,6 +1261,7 @@ app.post(
       }
 
       await client.query("BEGIN");
+      transactionStarted = true;
 
       const codeResult = await client.query(
         `SELECT *
@@ -999,11 +1273,23 @@ app.post(
 
       const reward = codeResult.rows[0];
 
-      if (!reward || !reward.active) {
+      if (!reward) {
         await client.query("ROLLBACK");
+        transactionStarted = false;
 
         return res.status(404).json({
-          error: "کد جایزه معتبر نیست یا غیرفعال شده است."
+          error: "کد اشتباه است.",
+          code: "INVALID_CODE"
+        });
+      }
+
+      if (!reward.active) {
+        await client.query("ROLLBACK");
+        transactionStarted = false;
+
+        return res.status(400).json({
+          error: "کد منقضی شده است.",
+          code: "EXPIRED_CODE"
         });
       }
 
@@ -1012,9 +1298,11 @@ app.post(
         new Date(reward.expires_at).getTime() <= Date.now()
       ) {
         await client.query("ROLLBACK");
+        transactionStarted = false;
 
         return res.status(400).json({
-          error: "مهلت استفاده از این کد به پایان رسیده است."
+          error: "کد منقضی شده است.",
+          code: "EXPIRED_CODE"
         });
       }
 
@@ -1027,11 +1315,16 @@ app.post(
 
       const usedCount = Number(usedResult.rows[0].count);
 
-      if (reward.max_uses > 0 && usedCount >= reward.max_uses) {
+      if (
+        reward.max_uses > 0 &&
+        usedCount >= reward.max_uses
+      ) {
         await client.query("ROLLBACK");
+        transactionStarted = false;
 
         return res.status(400).json({
-          error: "ظرفیت استفاده از این کد تکمیل شده است."
+          error: "ظرفیت استفاده از این کد تکمیل شده است.",
+          code: "CODE_LIMIT_REACHED"
         });
       }
 
@@ -1044,9 +1337,11 @@ app.post(
 
       if (alreadyUsed.rows.length > 0) {
         await client.query("ROLLBACK");
+        transactionStarted = false;
 
         return res.status(409).json({
-          error: "شما قبلاً از این کد استفاده کرده‌اید."
+          error: "شما قبلاً از این کد استفاده کرده‌اید.",
+          code: "ALREADY_USED"
         });
       }
 
@@ -1067,6 +1362,7 @@ app.post(
 
       if (!playerResult.rows[0]) {
         await client.query("ROLLBACK");
+        transactionStarted = false;
 
         return res.status(404).json({
           error: "بازیکن پیدا نشد."
@@ -1074,6 +1370,7 @@ app.post(
       }
 
       await client.query("COMMIT");
+      transactionStarted = false;
 
       res.json({
         message: "کد با موفقیت ثبت شد.",
@@ -1081,7 +1378,10 @@ app.post(
         player: publicPlayer(playerResult.rows[0])
       });
     } catch (error) {
-      await client.query("ROLLBACK").catch(() => {});
+      if (transactionStarted) {
+        await client.query("ROLLBACK").catch(() => {});
+      }
+
       next(error);
     } finally {
       client.release();
@@ -1089,7 +1389,10 @@ app.post(
   }
 );
 
-// Global error handler
+// =====================================================
+// مدیریت خطاها و راه‌اندازی سرور
+// =====================================================
+
 app.use((error, req, res, next) => {
   console.error("Server error:", error);
 
@@ -1102,13 +1405,14 @@ app.use((error, req, res, next) => {
   });
 });
 
-// Start server
 async function startServer() {
   try {
     await initializeDatabase();
 
     app.listen(PORT, () => {
-      console.log(`Bozorgshahr server listening on ${PORT}`);
+      console.log(
+        `Bozorgshahr server listening on ${PORT}`
+      );
     });
   } catch (error) {
     console.error("Could not start server:", error);
