@@ -202,10 +202,19 @@ function safeTextEqual(a, b) {
     crypto.timingSafeEqual(left, right);
 }
 
+// یکسان‌سازی کدهای فارسی و انگلیسی
 function normalizeRewardCode(value) {
   return String(value || "")
     .trim()
     .normalize("NFC")
+    .replace(/ي/g, "ی")
+    .replace(/ك/g, "ک")
+    .replace(/[٠-٩]/g, d =>
+      "٠١٢٣٤٥٦٧٨٩".indexOf(d)
+    )
+    .replace(/[۰-۹]/g, d =>
+      "۰۱۲۳۴۵۶۷۸۹".indexOf(d)
+    )
     .toUpperCase();
 }
 
@@ -213,7 +222,7 @@ app.get("/", (req, res) => {
   res.json({
     name: "Bozorgshahr Server",
     status: "online",
-    version: "1.3.0"
+    version: "1.4.0"
   });
 });
 
@@ -557,14 +566,14 @@ app.get(
         });
       }
 
-      res.json({        player: publicPlayer(result.rows[0])
+      res.json({
+        player: publicPlayer(result.rows[0])
       });
     } catch (error) {
       next(error);
     }
   }
 );
-
 // Admin: edit a player's game values
 app.patch(
   "/api/admin/players/:id",
@@ -619,6 +628,7 @@ app.patch(
           }
 
           if (key === "level") value = Math.max(1, value);
+
           if (key === "hunger" || key === "energy") {
             value = Math.min(100, value);
           }
@@ -627,8 +637,6 @@ app.patch(
         values.push(value);
         const parameterIndex = values.length;
 
-        // The same parameter is used in a SQL column and in JSONB.
-        // Give both usages explicit types to avoid PostgreSQL 42P08.
         if (key === "displayName") {
           updates.push(`display_name = $${parameterIndex}::varchar(40)`);
         } else {
@@ -655,28 +663,16 @@ app.patch(
         });
       }
 
-      const id = req.params.id;
-      values.push(id);
+      values.push(req.params.id);
 
-      let query;
-
-      if (syncParts.length) {
-        query = `
-          UPDATE players
-          SET ${updates.join(", ")},
-              game_data = COALESCE(game_data, '{}'::jsonb) ||
-                jsonb_build_object(${syncParts.join(", ")})
-          WHERE id = $${values.length}::bigint
-          RETURNING *
-        `;
-      } else {
-        query = `
-          UPDATE players
-          SET ${updates.join(", ")}
-          WHERE id = $${values.length}::bigint
-          RETURNING *
-        `;
-      }
+      const query = `
+        UPDATE players
+        SET ${updates.join(", ")},
+            game_data = COALESCE(game_data, '{}'::jsonb) ||
+              jsonb_build_object(${syncParts.join(", ")})
+        WHERE id = $${values.length}::bigint
+        RETURNING *
+      `;
 
       const result = await pool.query(query, values);
 
@@ -814,6 +810,7 @@ app.post(
     try {
       const code = normalizeRewardCode(req.body.code);
       const coins = Number(req.body.coins);
+
       const maxUses = req.body.maxUses == null
         ? 0
         : Number(req.body.maxUses);
@@ -832,9 +829,10 @@ app.post(
         expiresAt = date.toISOString();
       }
 
-      if (!/^[A-Z0-9_-]{3,64}$/.test(code)) {
+      // پذیرش حروف فارسی، انگلیسی، اعداد فارسی و انگلیسی
+      if (!/^[\p{L}\p{N}_-]{3,64}$/u.test(code)) {
         return res.status(400).json({
-          error: "کد باید بین ۳ تا ۶۴ نویسه و شامل حروف انگلیسی، عدد، خط تیره یا زیرخط باشد."
+          error: "کد باید بین ۳ تا ۶۴ نویسه و شامل حروف، عدد، خط تیره یا زیرخط باشد."
         });
       }
 
@@ -971,6 +969,7 @@ app.post(
   requireActivePlayer,
   async (req, res, next) => {
     const client = await pool.connect();
+    let transactionStarted = false;
 
     try {
       if (req.auth.role !== "player") {
@@ -988,7 +987,9 @@ app.post(
       }
 
       await client.query("BEGIN");
+      transactionStarted = true;
 
+      // قفل کد برای جلوگیری از مصرف هم‌زمان بیش از ظرفیت
       const codeResult = await client.query(
         `SELECT *
          FROM reward_codes
@@ -1001,6 +1002,7 @@ app.post(
 
       if (!reward || !reward.active) {
         await client.query("ROLLBACK");
+        transactionStarted = false;
 
         return res.status(404).json({
           error: "کد جایزه معتبر نیست یا غیرفعال شده است."
@@ -1012,6 +1014,7 @@ app.post(
         new Date(reward.expires_at).getTime() <= Date.now()
       ) {
         await client.query("ROLLBACK");
+        transactionStarted = false;
 
         return res.status(400).json({
           error: "مهلت استفاده از این کد به پایان رسیده است."
@@ -1029,6 +1032,7 @@ app.post(
 
       if (reward.max_uses > 0 && usedCount >= reward.max_uses) {
         await client.query("ROLLBACK");
+        transactionStarted = false;
 
         return res.status(400).json({
           error: "ظرفیت استفاده از این کد تکمیل شده است."
@@ -1044,12 +1048,14 @@ app.post(
 
       if (alreadyUsed.rows.length > 0) {
         await client.query("ROLLBACK");
+        transactionStarted = false;
 
         return res.status(409).json({
           error: "شما قبلاً از این کد استفاده کرده‌اید."
         });
       }
 
+      // ثبت مصرف و افزایش سکه در یک تراکنش واحد
       await client.query(
         `INSERT INTO reward_redemptions
          (player_id, code_id)
@@ -1067,6 +1073,7 @@ app.post(
 
       if (!playerResult.rows[0]) {
         await client.query("ROLLBACK");
+        transactionStarted = false;
 
         return res.status(404).json({
           error: "بازیکن پیدا نشد."
@@ -1074,14 +1081,33 @@ app.post(
       }
 
       await client.query("COMMIT");
+      transactionStarted = false;
 
+      const player = publicPlayer(playerResult.rows[0]);
+      const coinsAdded = Number(reward.coins);
+      const totalCoins = Number(player.coins);
+
+      // پاسخ هماهنگ با نسخه جدید بازی
       res.json({
+        success: true,
+        ok: true,
         message: "کد با موفقیت ثبت شد.",
-        coinsAdded: reward.coins,
-        player: publicPlayer(playerResult.rows[0])
+        coinsAdded,
+        coinsAwarded: coinsAdded,
+        totalCoins,
+        player
       });
     } catch (error) {
-      await client.query("ROLLBACK").catch(() => {});
+      if (transactionStarted) {
+        await client.query("ROLLBACK").catch(() => {});
+      }
+
+      if (error.code === "23505") {
+        return res.status(409).json({
+          error: "شما قبلاً از این کد استفاده کرده‌اید."
+        });
+      }
+
       next(error);
     } finally {
       client.release();
